@@ -709,7 +709,6 @@ impl ModelWeights {
         metadata: Option<(Vec<(Tensor, Tensor)>, &PagedAttentionInputMetadata)>,
     ) -> Result<Tensor> {
         let mut layer_in = self.tok_embeddings.forward(x)?.to_dtype(self.dtype)?;
-        eprintln!("[qwen35moe] forward: input shape={:?} dtype={:?}", layer_in.shape(), layer_in.dtype());
         let mut local_cache = self.local_cache.lock().unwrap();
 
         // Reset GDN caches on new sequence
@@ -747,7 +746,6 @@ impl ModelWeights {
         };
 
         for (i, layer) in self.layers.iter().enumerate() {
-            eprintln!("[qwen35moe] layer {i}: in dtype={:?} shape={:?}", layer_in.dtype(), layer_in.shape());
             if let Some(ref mapper) = self.mapper {
                 layer_in = mapper.map(layer_in, i)?;
             }

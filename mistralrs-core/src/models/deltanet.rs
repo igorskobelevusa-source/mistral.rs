@@ -698,9 +698,6 @@ impl GatedDeltaNet {
             a,
         } = projected;
 
-        eprintln!("[gdn] after project: q={:?} k={:?} v={:?} z={:?} b={:?} a={:?}",
-            q.dtype(), k.dtype(), v_flat.dtype(), z.dtype(), b.dtype(), a.dtype());
-
         // 2. Concatenate q, k, v for conv1d: (batch, seq, conv_dim)
         let mixed_qkv = Tensor::cat(&[&q, &k, &v_flat], D::Minus1)?;
 
@@ -712,8 +709,6 @@ impl GatedDeltaNet {
             self.causal_conv1d_full(&mixed_qkv, cache)
                 .map_err(|e| candle_core::Error::Msg(format!("gdn conv1d_full(seq={seq_len}): {e}")))?
         };
-        eprintln!("[gdn] after conv1d: dtype={:?}", mixed_qkv.dtype());
-
         // 4. Split back after conv and reshape to per-head
         let q = mixed_qkv.narrow(D::Minus1, 0, self.key_dim)?;
         let k = mixed_qkv.narrow(D::Minus1, self.key_dim, self.key_dim)?;
@@ -726,8 +721,6 @@ impl GatedDeltaNet {
         // 5. Compute beta and g (3D: batch, seq, num_v_heads)
         let (beta, g) = self.compute_gating(&b, &a, dtype)
             .map_err(|e| candle_core::Error::Msg(format!("gdn compute_gating: {e}")))?;
-        eprintln!("[gdn] after gating: beta={:?} g={:?}", beta.dtype(), g.dtype());
-
         // 6. If num_v_heads > num_k_heads, repeat_interleave q and k
         let (q, k) = if v_per_group > 1 {
             let q = q
