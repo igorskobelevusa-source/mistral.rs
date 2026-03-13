@@ -698,6 +698,28 @@ impl ModelConfig::FromGGUF for ModelWeights {
     }
 }
 
+// ====================== Cache management ======================
+
+impl ModelWeights {
+    /// Clear the local hybrid cache (GDN recurrent state + attention KV).
+    /// Called by the pipeline between requests to free GPU memory.
+    pub fn clear_local_cache(&self) {
+        let mut local_cache = self.local_cache.lock().unwrap();
+        // Free attention KV caches FIRST (these are large, grow with seq_len)
+        for cache in &mut local_cache.caches {
+            if let LocalLayerCache::Attention(kv_cache) = cache {
+                kv_cache.reset();
+            }
+        }
+        // Then reset GDN caches (small fixed-size, zeros_like allocates before freeing)
+        for cache in &mut local_cache.caches {
+            if let LocalLayerCache::LinearAttention(gdn_cache) = cache {
+                let _ = gdn_cache.reset();
+            }
+        }
+    }
+}
+
 // ====================== Forward pass ======================
 
 impl ModelWeights {
@@ -708,22 +730,20 @@ impl ModelWeights {
         context_lens: Vec<(usize, usize)>,
         metadata: Option<(Vec<(Tensor, Tensor)>, &PagedAttentionInputMetadata)>,
     ) -> Result<Tensor> {
-        let fwd_start = std::time::Instant::now();
-        let seq_len = x.dims()[1];
-        eprintln!("[qwen35moe] forward x.shape={:?} start_offsets={:?} is_prompt={}", x.dims(), start_offsets, start_offsets[0] == 0);
         let mut layer_in = self.tok_embeddings.forward(x)?.to_dtype(self.dtype)?;
         let mut local_cache = self.local_cache.lock().unwrap();
 
-        // Reset ALL caches on new sequence (both GDN recurrent state and attention KV)
+        // Reset ALL caches on new sequence (both GDN recurrent state and attention KV).
+        // Free attention KV first (large), then GDN (small but zeros_like allocates).
         if start_offsets[0] == 0 {
             for cache in &mut local_cache.caches {
-                match cache {
-                    LocalLayerCache::LinearAttention(gdn_cache) => {
-                        gdn_cache.reset()?;
-                    }
-                    LocalLayerCache::Attention(kv_cache) => {
-                        kv_cache.reset();
-                    }
+                if let LocalLayerCache::Attention(kv_cache) = cache {
+                    kv_cache.reset();
+                }
+            }
+            for cache in &mut local_cache.caches {
+                if let LocalLayerCache::LinearAttention(gdn_cache) = cache {
+                    gdn_cache.reset()?;
                 }
             }
         }
@@ -800,7 +820,6 @@ impl ModelWeights {
         let x = self.norm.forward(&layer_in)?;
         let x = extract_logits(&x, context_lens)?;
         let result = self.output.forward_autocast(&x.contiguous()?)?;
-        eprintln!("[qwen35moe] forward seq_len={seq_len} took {:.3}s", fwd_start.elapsed().as_secs_f64());
         Ok(result)
     }
 }

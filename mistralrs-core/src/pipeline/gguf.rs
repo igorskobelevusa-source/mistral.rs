@@ -683,6 +683,12 @@ impl CacheManagerMixin for GGUFPipeline {
                 load_preallocated_cache,
             );
         }
+        // Qwen3Next uses a local hybrid cache (GDN + attention KV) that is
+        // separate from the pipeline-level EitherCache. Clear it here so GPU
+        // memory is freed between requests.
+        if let Model::Qwen3Next(ref model) = self.model {
+            model.clear_local_cache();
+        }
         if reset_non_granular {
             self.reset_non_granular_state()
         }
