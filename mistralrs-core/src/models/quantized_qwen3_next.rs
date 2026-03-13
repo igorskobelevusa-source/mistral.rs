@@ -760,7 +760,7 @@ impl ModelWeights {
                             metadata
                                 .as_ref()
                                 .map(|(kv_cache, metadata)| (kv_cache[i].clone(), *metadata)),
-                        )?
+                        ).map_err(|e| candle_core::Error::Msg(format!("layer {i} full_attn: {e}")))?
                     } else {
                         candle_core::bail!("Expected KV cache for full attention layer {i}");
                     }
@@ -768,18 +768,22 @@ impl ModelWeights {
                 LayerImpl::LinearAttention(gdn) => {
                     if let LocalLayerCache::LinearAttention(ref mut gdn_cache) = local_cache.caches[i]
                     {
-                        gdn.forward(&x, gdn_cache)?
+                        gdn.forward(&x, gdn_cache)
+                            .map_err(|e| candle_core::Error::Msg(format!("layer {i} gdn: {e}")))?
                     } else {
                         candle_core::bail!("Expected GDN cache for linear attention layer {i}");
                     }
                 }
             };
 
-            let x = (attn_out + residual)?;
+            let x = (attn_out + residual)
+                .map_err(|e| candle_core::Error::Msg(format!("layer {i} attn_residual: {e}")))?;
             let residual = &x;
             let x = layer.ffn_norm.forward(&x)?;
-            let x = layer.moe.forward(&x)?;
-            layer_in = (x + residual)?;
+            let x = layer.moe.forward(&x)
+                .map_err(|e| candle_core::Error::Msg(format!("layer {i} moe: {e}")))?;
+            layer_in = (x + residual)
+                .map_err(|e| candle_core::Error::Msg(format!("layer {i} moe_residual: {e}")))?;
         }
 
         let x = self.norm.forward(&layer_in)?;
