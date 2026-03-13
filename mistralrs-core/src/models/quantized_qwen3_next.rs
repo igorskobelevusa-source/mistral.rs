@@ -705,7 +705,7 @@ impl ModelWeights {
         context_lens: Vec<(usize, usize)>,
         metadata: Option<(Vec<(Tensor, Tensor)>, &PagedAttentionInputMetadata)>,
     ) -> Result<Tensor> {
-        let mut layer_in = self.tok_embeddings.forward(x)?;
+        let mut layer_in = self.tok_embeddings.forward(x)?.to_dtype(self.dtype)?;
         let mut local_cache = self.local_cache.lock().unwrap();
 
         // Reset GDN caches on new sequence
@@ -768,21 +768,17 @@ impl ModelWeights {
                 LayerImpl::LinearAttention(gdn) => {
                     if let LocalLayerCache::LinearAttention(ref mut gdn_cache) = local_cache.caches[i]
                     {
-                        // CUDA conv1d kernel requires bf16/f16; QRmsNorm may output f32
-                        let original_dtype = x.dtype();
-                        let x_bf16 = x.to_dtype(DType::BF16)?;
-                        gdn.forward(&x_bf16, gdn_cache)?.to_dtype(original_dtype)?
+                        gdn.forward(&x, gdn_cache)?
                     } else {
                         candle_core::bail!("Expected GDN cache for linear attention layer {i}");
                     }
                 }
             };
 
-            let attn_out = attn_out.to_dtype(layer_in.dtype())?;
             let x = (attn_out + residual)?;
             let residual = &x;
             let x = layer.ffn_norm.forward(&x)?;
-            let x = layer.moe.forward(&x)?.to_dtype(layer_in.dtype())?;
+            let x = layer.moe.forward(&x)?;
             layer_in = (x + residual)?;
         }
 
