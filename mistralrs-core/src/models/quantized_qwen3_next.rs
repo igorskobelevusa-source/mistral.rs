@@ -778,10 +778,11 @@ impl ModelWeights {
                 }
             };
 
+            let attn_out = attn_out.to_dtype(layer_in.dtype())?;
             let x = (attn_out + residual)?;
             let residual = &x;
             let x = layer.ffn_norm.forward(&x)?;
-            let x = layer.moe.forward(&x)?;
+            let x = layer.moe.forward(&x)?.to_dtype(layer_in.dtype())?;
             layer_in = (x + residual)?;
         }
 
