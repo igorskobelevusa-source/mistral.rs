@@ -68,7 +68,7 @@ impl FusedMoe {
         }
 
         let ys = {
-            let xs = xs.reshape((num_tokens, 1, hidden_dim))?;
+            let xs = xs.to_dtype(DType::F32)?.reshape((num_tokens, 1, hidden_dim))?;
             let gate = self.gate_experts.indexed_moe_forward(&xs, &indices)?;
             let up = self.up_experts.indexed_moe_forward(&xs, &indices)?;
             let activated = crate::ops::mul_and_act(&gate, &up, crate::layers::Activation::Silu)?;
