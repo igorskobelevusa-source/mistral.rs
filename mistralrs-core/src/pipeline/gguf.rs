@@ -653,6 +653,12 @@ impl IsqPipelineMixin for GGUFPipeline {
 
 impl CacheManagerMixin for GGUFPipeline {
     fn clone_in_cache(&self, seqs: &mut [&mut Sequence]) {
+        // Qwen3Next: free local_cache before clone_in allocates pipeline cache
+        // tensors. Prefix caching uses clone_in rather than set_none_cache, and
+        // local_cache holds the real KV data that the pipeline cache can't see.
+        if let Model::Qwen3Next(ref model) = self.model {
+            model.clear_local_cache();
+        }
         if matches!(self.cache(), EitherCache::Full(_)) {
             FullCacheManager.clone_in_cache(self, seqs, false)
         } else {

@@ -721,15 +721,17 @@ impl GatedDeltaNet {
         // 5. Compute beta and g (3D: batch, seq, num_v_heads)
         let (beta, g) = self.compute_gating(&b, &a, dtype)
             .map_err(|e| candle_core::Error::Msg(format!("gdn compute_gating: {e}")))?;
-        // 6. If num_v_heads > num_k_heads, repeat_interleave q and k
+        // 6. If num_v_heads > num_k_heads, tile-repeat q and k.
+        // GGUF uses tiled V-head layout: [K0..K15, K0..K15] (NOT interleaved
+        // [K0,K0,K1,K1,...]).  unsqueeze(2) + broadcast gives tiled order.
         let (q, k) = if v_per_group > 1 {
             let q = q
-                .unsqueeze(3)?
-                .repeat((1, 1, 1, v_per_group, 1))?
+                .unsqueeze(2)?
+                .broadcast_as((batch_size, seq_len, v_per_group, self.num_k_heads, self.head_k_dim))?
                 .reshape((batch_size, seq_len, self.num_v_heads, self.head_k_dim))?;
             let k = k
-                .unsqueeze(3)?
-                .repeat((1, 1, 1, v_per_group, 1))?
+                .unsqueeze(2)?
+                .broadcast_as((batch_size, seq_len, v_per_group, self.num_k_heads, self.head_k_dim))?
                 .reshape((batch_size, seq_len, self.num_v_heads, self.head_k_dim))?;
             (q, k)
         } else {
