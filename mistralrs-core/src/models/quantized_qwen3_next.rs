@@ -86,7 +86,7 @@ struct SharedExpert {
     gate_proj: Arc<dyn QuantMethod>,
     up_proj: Arc<dyn QuantMethod>,
     down_proj: Arc<dyn QuantMethod>,
-    shared_gate: Arc<dyn QuantMethod>,
+    shared_gate: candle_nn::Linear,
 }
 
 impl SharedExpert {
@@ -95,9 +95,9 @@ impl SharedExpert {
         let up = self.up_proj.forward_autocast(xs)?;
         let mlp_out = crate::ops::mul_and_act(&gate, &up, crate::layers::Activation::Silu)?;
         let mlp_out = self.down_proj.forward_autocast(&mlp_out)?;
-        // Sigmoid gating
-        let gate_val = candle_nn::ops::sigmoid(&self.shared_gate.forward_autocast(xs)?)?;
-        gate_val.broadcast_mul(&mlp_out)
+        // Sigmoid gating — shared_gate is [1, hidden] linear, outputs scalar per token
+        let gate_val = candle_nn::ops::sigmoid(&self.shared_gate.forward(&xs.to_dtype(self.shared_gate.weight().dtype())?)?)?;
+        gate_val.to_dtype(mlp_out.dtype())?.broadcast_mul(&mlp_out)
     }
 }
 
@@ -656,13 +656,16 @@ impl ModelConfig::FromGGUF for ModelWeights {
             let shared_gate_proj = ct.tensor(&format!("{prefix}.ffn_gate_shexp.weight"), device)?;
             let shared_up_proj = ct.tensor(&format!("{prefix}.ffn_up_shexp.weight"), device)?;
             let shared_down_proj = ct.tensor(&format!("{prefix}.ffn_down_shexp.weight"), device)?;
-            let shared_gate = ct.tensor(&format!("{prefix}.ffn_gate_inp_shexp.weight"), device)?;
+            let shared_gate_qt = ct.tensor(&format!("{prefix}.ffn_gate_inp_shexp.weight"), device)?;
+            let shared_gate_w = shared_gate_qt.dequantize(device)?
+                .reshape((1, props.embedding_length))?;
+            let shared_gate = candle_nn::Linear::new(shared_gate_w, None);
 
             let shared_expert = SharedExpert {
                 gate_proj: gguf_matmul(shared_gate_proj)?,
                 up_proj: gguf_matmul(shared_up_proj)?,
                 down_proj: gguf_matmul(shared_down_proj)?,
-                shared_gate: gguf_matmul(shared_gate)?,
+                shared_gate,
             };
 
             layers.push(DecoderLayer {
