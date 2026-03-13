@@ -149,10 +149,15 @@ impl FullAttentionLayer {
         let k = MatMul.qmethod_matmul(x, &*self.attention_wk)?;
         let v = MatMul.qmethod_matmul(x, &*self.attention_wv)?;
 
-        // If Q projects to 2*head_dim, split into query and output gate.
+        // If Q projects to 2*head_dim per head, split into query and output gate.
+        // Gate values are interleaved per head: reshape to (b, seq, n_head, 2*head_dim)
+        // then narrow dim 3 to split each head's [q | gate].
         let (q, output_gate) = if self.has_output_gate {
-            let q = q_full.narrow(D::Minus1, 0, self.n_head * self.head_dim)?;
-            let gate = q_full.narrow(D::Minus1, self.n_head * self.head_dim, self.n_head * self.head_dim)?;
+            let q_gate = q_full.reshape((b_sz, seq_len, self.n_head, self.head_dim * 2))?;
+            let q = q_gate.narrow(D::Minus1, 0, self.head_dim)?
+                .reshape((b_sz, seq_len, self.n_head * self.head_dim))?;
+            let gate = q_gate.narrow(D::Minus1, self.head_dim, self.head_dim)?
+                .reshape((b_sz, seq_len, self.n_head * self.head_dim))?;
             (q, Some(gate))
         } else {
             (q_full, None)
