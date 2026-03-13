@@ -442,6 +442,7 @@ pub trait Pipeline:
         rng: Arc<std::sync::Mutex<Isaac64Rng>>,
         backend_metadata: CacheBackendMetadata,
     ) -> Result<Duration, candle_core::Error> {
+        eprintln!("[pipeline::step] is_prompt={is_prompt} seqs={}", input_seqs.len());
         match backend_metadata {
             CacheBackendMetadata::DefaultInstructions { pre_op, post_op } => {
                 let inputs_iter =
