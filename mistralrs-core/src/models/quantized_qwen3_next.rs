@@ -708,6 +708,8 @@ impl ModelWeights {
         context_lens: Vec<(usize, usize)>,
         metadata: Option<(Vec<(Tensor, Tensor)>, &PagedAttentionInputMetadata)>,
     ) -> Result<Tensor> {
+        let fwd_start = std::time::Instant::now();
+        let seq_len = x.dims()[1];
         let mut layer_in = self.tok_embeddings.forward(x)?.to_dtype(self.dtype)?;
         let mut local_cache = self.local_cache.lock().unwrap();
 
@@ -791,7 +793,9 @@ impl ModelWeights {
 
         let x = self.norm.forward(&layer_in)?;
         let x = extract_logits(&x, context_lens)?;
-        self.output.forward_autocast(&x.contiguous()?)
+        let result = self.output.forward_autocast(&x.contiguous()?)?;
+        eprintln!("[qwen35moe] forward seq_len={seq_len} took {:.3}s", fwd_start.elapsed().as_secs_f64());
+        Ok(result)
     }
 }
 
