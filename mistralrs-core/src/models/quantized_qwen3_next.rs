@@ -714,11 +714,16 @@ impl ModelWeights {
         let mut layer_in = self.tok_embeddings.forward(x)?.to_dtype(self.dtype)?;
         let mut local_cache = self.local_cache.lock().unwrap();
 
-        // Reset GDN caches on new sequence
+        // Reset ALL caches on new sequence (both GDN recurrent state and attention KV)
         if start_offsets[0] == 0 {
             for cache in &mut local_cache.caches {
-                if let LocalLayerCache::LinearAttention(gdn_cache) = cache {
-                    gdn_cache.reset()?;
+                match cache {
+                    LocalLayerCache::LinearAttention(gdn_cache) => {
+                        gdn_cache.reset()?;
+                    }
+                    LocalLayerCache::Attention(kv_cache) => {
+                        kv_cache.reset();
+                    }
                 }
             }
         }
