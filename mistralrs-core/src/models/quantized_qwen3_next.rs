@@ -16,7 +16,7 @@ use std::sync::Arc;
 use crate::attention::SdpaParams;
 use crate::device_map::{DeviceMappedMask, DeviceMapper};
 use crate::gguf::Content;
-use crate::layers::{CausalMasker, MatMul, QRmsNorm, RotaryEmbedding, Sdpa};
+use crate::layers::{CausalMasker, QRmsNorm, RotaryEmbedding, Sdpa};
 use crate::layers_masker::PastKvLenCache;
 use crate::models::deltanet::{GatedDeltaNet, GdnLayerCache, GdnProjection, RmsNormGated};
 use crate::ops::{TopKLastDimOp, TopKOutput};
@@ -91,12 +91,12 @@ struct SharedExpert {
 
 impl SharedExpert {
     fn forward(&self, xs: &Tensor) -> Result<Tensor> {
-        let gate = MatMul.qmethod_matmul(xs, &*self.gate_proj)?;
-        let up = MatMul.qmethod_matmul(xs, &*self.up_proj)?;
+        let gate = self.gate_proj.forward_autocast(xs)?;
+        let up = self.up_proj.forward_autocast(xs)?;
         let mlp_out = crate::ops::mul_and_act(&gate, &up, crate::layers::Activation::Silu)?;
-        let mlp_out = MatMul.qmethod_matmul(&mlp_out, &*self.down_proj)?;
+        let mlp_out = self.down_proj.forward_autocast(&mlp_out)?;
         // Sigmoid gating
-        let gate_val = candle_nn::ops::sigmoid(&MatMul.qmethod_matmul(xs, &*self.shared_gate)?)?;
+        let gate_val = candle_nn::ops::sigmoid(&self.shared_gate.forward_autocast(xs)?)?;
         gate_val.broadcast_mul(&mlp_out)
     }
 }
@@ -145,9 +145,9 @@ impl FullAttentionLayer {
     ) -> Result<Tensor> {
         let (b_sz, seq_len, _) = x.dims3()?;
 
-        let q_full = MatMul.qmethod_matmul(x, &*self.attention_wq)?;
-        let k = MatMul.qmethod_matmul(x, &*self.attention_wk)?;
-        let v = MatMul.qmethod_matmul(x, &*self.attention_wv)?;
+        let q_full = self.attention_wq.forward_autocast(x)?;
+        let k = self.attention_wk.forward_autocast(x)?;
+        let v = self.attention_wv.forward_autocast(x)?;
 
         // If Q projects to 2*head_dim per head, split into query and output gate.
         // Gate values are interleaved per head: reshape to (b, seq, n_head, 2*head_dim)
@@ -234,7 +234,7 @@ impl FullAttentionLayer {
             y = (y * candle_nn::ops::sigmoid(gate)?)?;
         }
 
-        let y = MatMul.qmethod_matmul(&y.to_dtype(x.dtype())?, &*self.attention_wo)?;
+        let y = self.attention_wo.forward_autocast(&y.to_dtype(x.dtype())?)?;
         Ok(y)
     }
 }
@@ -784,7 +784,7 @@ impl ModelWeights {
 
         let x = self.norm.forward(&layer_in)?;
         let x = extract_logits(&x, context_lens)?;
-        MatMul.qmethod_matmul(&x.contiguous()?, &*self.output)
+        self.output.forward_autocast(&x.contiguous()?)
     }
 }
 

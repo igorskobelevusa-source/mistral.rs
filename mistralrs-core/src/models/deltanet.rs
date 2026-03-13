@@ -10,7 +10,6 @@ use mistralrs_quant::{QuantMethod, QuantizedConfig, RowParallelLayer, ShardedVar
 use std::sync::Arc;
 
 use crate::device_map::DeviceMapper;
-use crate::layers::MatMul;
 
 // ====================== DeltaNet Config Trait ======================
 
@@ -582,8 +581,10 @@ impl GatedDeltaNet {
                 in_proj_qkvz,
                 in_proj_ba,
             } => {
-                let mixed_qkvz = MatMul.qmethod_matmul(x, &**in_proj_qkvz)?;
-                let mixed_ba = MatMul.qmethod_matmul(x, &**in_proj_ba)?;
+                // Use forward_autocast to handle GGUF dtype (F32 matmul → restore original dtype).
+                // For safetensor/ISQ weights, quantized_act_type() is None so this is a no-op.
+                let mixed_qkvz = in_proj_qkvz.forward_autocast(x)?;
+                let mixed_ba = in_proj_ba.forward_autocast(x)?;
 
                 let group_size_qkvz = 2 * self.head_k_dim + 2 * v_per_group * self.head_v_dim;
                 let mixed_qkvz =
@@ -630,10 +631,10 @@ impl GatedDeltaNet {
                 in_proj_b,
                 in_proj_a,
             } => {
-                let proj_qkv = MatMul.qmethod_matmul(x, &**in_proj_qkv)?;
-                let z_full = MatMul.qmethod_matmul(x, &**in_proj_z)?;
-                let b = MatMul.qmethod_matmul(x, &**in_proj_b)?;
-                let a = MatMul.qmethod_matmul(x, &**in_proj_a)?;
+                let proj_qkv = in_proj_qkv.forward_autocast(x)?;
+                let z_full = in_proj_z.forward_autocast(x)?;
+                let b = in_proj_b.forward_autocast(x)?;
+                let a = in_proj_a.forward_autocast(x)?;
 
                 let q = proj_qkv.narrow(D::Minus1, 0, self.key_dim)?;
                 let k = proj_qkv.narrow(D::Minus1, self.key_dim, self.key_dim)?;
@@ -658,12 +659,12 @@ impl GatedDeltaNet {
                 in_proj_b,
                 in_proj_a,
             } => {
-                let q = MatMul.qmethod_matmul(x, &**in_proj_q)?;
-                let k = MatMul.qmethod_matmul(x, &**in_proj_k)?;
-                let v_flat = MatMul.qmethod_matmul(x, &**in_proj_v)?;
-                let z_full = MatMul.qmethod_matmul(x, &**in_proj_z)?;
-                let b = MatMul.qmethod_matmul(x, &**in_proj_b)?;
-                let a = MatMul.qmethod_matmul(x, &**in_proj_a)?;
+                let q = in_proj_q.forward_autocast(x)?;
+                let k = in_proj_k.forward_autocast(x)?;
+                let v_flat = in_proj_v.forward_autocast(x)?;
+                let z_full = in_proj_z.forward_autocast(x)?;
+                let b = in_proj_b.forward_autocast(x)?;
+                let a = in_proj_a.forward_autocast(x)?;
 
                 let z = z_full.reshape((batch_size, seq_len, self.num_v_heads, self.head_v_dim))?;
 
@@ -751,15 +752,7 @@ impl GatedDeltaNet {
         let y = y.reshape((batch_size, seq_len, self.value_dim))?;
 
         // 10. Output projection
-        let original_dtype = x.dtype();
-        let mut y_proj = y;
-        if let Some(t) = self.out_proj.quantized_act_type() {
-            y_proj = y_proj.to_dtype(t)?;
-        }
-        let mut res = MatMul.qmethod_matmul(&y_proj, &*self.out_proj)?;
-        if self.out_proj.quantized_act_type().is_some() {
-            res = res.to_dtype(original_dtype)?;
-        }
+        let res = self.out_proj.forward_autocast(&y)?;
         Ok(res)
     }
 
