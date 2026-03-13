@@ -769,8 +769,9 @@ impl ModelWeights {
                     if let LocalLayerCache::LinearAttention(ref mut gdn_cache) = local_cache.caches[i]
                     {
                         // CUDA conv1d kernel requires bf16/f16; QRmsNorm may output f32
+                        let original_dtype = x.dtype();
                         let x_bf16 = x.to_dtype(DType::BF16)?;
-                        gdn.forward(&x_bf16, gdn_cache)?
+                        gdn.forward(&x_bf16, gdn_cache)?.to_dtype(original_dtype)?
                     } else {
                         candle_core::bail!("Expected GDN cache for linear attention layer {i}");
                     }
