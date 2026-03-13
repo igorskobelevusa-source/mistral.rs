@@ -43,6 +43,7 @@ use crate::{
     models::quantized_qwen::ModelWeights as QQwen,
     models::quantized_qwen3::ModelWeights as QQwen3,
     models::quantized_qwen3_moe::ModelWeights as QQwen3MoE,
+    models::quantized_qwen3_next::ModelWeights as QQwen3Next,
     models::quantized_starcoder2::ModelWeights as QStarcoder2,
     utils::tokens::get_token,
     xlora_models::{XLoraQLlama, XLoraQPhi3},
@@ -72,6 +73,7 @@ enum Model {
     Qwen(QQwen),
     Qwen3(QQwen3),
     Qwen3MoE(QQwen3MoE),
+    Qwen3Next(QQwen3Next),
 }
 
 pub struct GGUFPipeline {
@@ -482,6 +484,7 @@ impl Loader for GGUFLoader {
                 GGUFArchitecture::Qwen2 => Model::Qwen(QQwen::try_from(model_config)?),
                 GGUFArchitecture::Qwen3 => Model::Qwen3(QQwen3::try_from(model_config)?),
                 GGUFArchitecture::Qwen3MoE => Model::Qwen3MoE(QQwen3MoE::try_from(model_config)?),
+                GGUFArchitecture::Qwen35Moe => Model::Qwen3Next(QQwen3Next::try_from(model_config)?),
                 a => bail!("Unsupported architecture `{a:?}` for GGUF"),
             },
             ModelKind::GgufAdapter { adapter, .. } => match arch {
@@ -548,6 +551,7 @@ impl Loader for GGUFLoader {
             Model::Qwen(ref p) => p.max_seq_len,
             Model::Qwen3(ref p) => p.max_seq_len,
             Model::Qwen3MoE(ref p) => p.max_seq_len,
+            Model::Qwen3Next(ref p) => p.max_seq_len,
         };
         let llg_factory = build_llg_factory(tokenizer.clone())?;
         let num_hidden_layers = match model {
@@ -560,6 +564,7 @@ impl Loader for GGUFLoader {
             Model::Qwen(ref model) => model.cache.normal().0.len(),
             Model::Qwen3(ref model) => model.cache.normal().0.len(),
             Model::Qwen3MoE(ref model) => model.cache.normal().0.len(),
+            Model::Qwen3Next(ref model) => model.cache.normal().0.len(),
         };
 
         if chat_template.bos_token.is_none() {
@@ -693,6 +698,7 @@ impl CacheManagerMixin for GGUFPipeline {
             Model::Qwen(ref model) => &model.cache,
             Model::Qwen3(ref model) => &model.cache,
             Model::Qwen3MoE(ref model) => &model.cache,
+            Model::Qwen3Next(ref model) => &model.cache,
         }
     }
 }
@@ -709,6 +715,7 @@ impl MetadataMixin for GGUFPipeline {
             Model::Qwen(ref model) => model.device.clone(),
             Model::Qwen3(ref model) => model.device.clone(),
             Model::Qwen3MoE(ref model) => model.device.clone(),
+            Model::Qwen3Next(ref model) => model.device.clone(),
         }
     }
     fn tokenizer(&self) -> Option<Arc<Tokenizer>> {
@@ -804,6 +811,9 @@ impl Pipeline for GGUFPipeline {
                 model.forward(&input_ids, &seqlen_offsets, context_lens, paged_attn_meta)?
             }
             Model::Qwen3MoE(ref model) => {
+                model.forward(&input_ids, &seqlen_offsets, context_lens, paged_attn_meta)?
+            }
+            Model::Qwen3Next(ref model) => {
                 model.forward(&input_ids, &seqlen_offsets, context_lens, paged_attn_meta)?
             }
         };

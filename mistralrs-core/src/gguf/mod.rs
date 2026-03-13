@@ -29,6 +29,8 @@ pub enum GGUFArchitecture {
     Qwen2,
     Qwen3,
     Qwen3MoE,
+    #[strum(serialize = "qwen35moe")]
+    Qwen35Moe,
     Mistral3,
 }
 
