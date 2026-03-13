@@ -357,27 +357,34 @@ impl TryFrom<ContentMetadata<'_>> for PropsGGUF {
             .unwrap_or(embed_len / head_count);
 
         // GDN linear attention head configuration.
-        // These metadata keys follow the pattern llama.cpp uses for Qwen3.5:
-        let linear_num_k_heads = c
-            .get_value::<u32>("attention.linear_head_count_kv")
+        // ssm.state_size = per-head dim for both K and V in GDN (default 128)
+        let ssm_state_size = c
+            .get_value::<u32>("ssm.state_size")
             .ok()
             .map(|x| x as usize)
-            .unwrap_or(16);
+            .unwrap_or(128);
+        // ssm.group_count = num_k_heads (default 16, same as attention head_count)
+        let linear_num_k_heads = c
+            .get_value::<u32>("ssm.group_count")
+            .ok()
+            .map(|x| x as usize)
+            .unwrap_or(head_count);
+        // num_v_heads = 2 * num_k_heads for Qwen3.5 (kv_group_size=2)
         let linear_num_v_heads = c
             .get_value::<u32>("attention.linear_head_count")
             .ok()
             .map(|x| x as usize)
-            .unwrap_or(32);
+            .unwrap_or(linear_num_k_heads * 2);
         let linear_head_k_dim = c
             .get_value::<u32>("attention.linear_key_length")
             .ok()
             .map(|x| x as usize)
-            .unwrap_or(head_dim);
+            .unwrap_or(ssm_state_size);
         let linear_head_v_dim = c
             .get_value::<u32>("attention.linear_value_length")
             .ok()
             .map(|x| x as usize)
-            .unwrap_or(head_dim);
+            .unwrap_or(ssm_state_size);
         let linear_conv_kernel_size = c
             .get_value::<u32>("ssm.conv_kernel")
             .ok()
