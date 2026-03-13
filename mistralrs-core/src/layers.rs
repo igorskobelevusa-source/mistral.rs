@@ -346,7 +346,8 @@ impl QRmsNorm {
     }
 
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        candle_nn::ops::rms_norm(&x.contiguous()?, &self.weight, self.eps as f32)
+        let w = self.weight.to_dtype(x.dtype())?;
+        candle_nn::ops::rms_norm(&x.contiguous()?, &w, self.eps as f32)
     }
 }
 
