@@ -114,6 +114,37 @@ impl MoeBlock {
     }
 }
 
+/// Dense SwiGLU MLP (used by non-MoE Qwen3.5 variants like the 9B dense model).
+struct DenseMlp {
+    gate_proj: Arc<dyn QuantMethod>,
+    up_proj: Arc<dyn QuantMethod>,
+    down_proj: Arc<dyn QuantMethod>,
+}
+
+impl DenseMlp {
+    fn forward(&self, xs: &Tensor) -> Result<Tensor> {
+        let gate = self.gate_proj.forward_autocast(xs)?;
+        let up = self.up_proj.forward_autocast(xs)?;
+        let activated = crate::ops::mul_and_act(&gate, &up, crate::layers::Activation::Silu)?;
+        self.down_proj.forward_autocast(&activated)
+    }
+}
+
+/// Feed-forward block — either MoE (sparse + shared expert) or dense MLP.
+enum FfnBlock {
+    Moe(MoeBlock),
+    Dense(DenseMlp),
+}
+
+impl FfnBlock {
+    fn forward(&self, xs: &Tensor) -> Result<Tensor> {
+        match self {
+            FfnBlock::Moe(moe) => moe.forward(xs),
+            FfnBlock::Dense(mlp) => mlp.forward(xs),
+        }
+    }
+}
+
 // ====================== Full attention layer (with output gate) ======================
 
 struct FullAttentionLayer {
@@ -250,7 +281,7 @@ struct DecoderLayer {
     layer_impl: LayerImpl,
     attn_norm: QRmsNorm,
     ffn_norm: QRmsNorm,
-    moe: MoeBlock,
+    ffn: FfnBlock,
 }
 
 // ====================== Per-layer cache ======================
@@ -307,10 +338,8 @@ struct PropsGGUF {
     max_seq_len: usize,
     rope_freq_base: f32,
     head_dim: usize,
-    num_experts: usize,
-    num_experts_per_tok: usize,
-    expert_intermediate_size: usize,
-    shared_expert_intermediate_size: usize,
+    num_experts: Option<usize>,
+    num_experts_per_tok: Option<usize>,
     // GDN-specific
     linear_num_k_heads: usize,
     linear_num_v_heads: usize,
@@ -328,8 +357,8 @@ fn verify_arch(
         .cloned()
         .try_value_into()?;
 
-    if actual_arch != "qwen35moe" {
-        candle_core::bail!("Expected `qwen35moe` architecture, got `{actual_arch}`.");
+    if actual_arch != "qwen35moe" && actual_arch != "qwen35" {
+        candle_core::bail!("Expected `qwen35moe` or `qwen35` architecture, got `{actual_arch}`.");
     }
     Ok(actual_arch)
 }
@@ -391,16 +420,6 @@ impl TryFrom<ContentMetadata<'_>> for PropsGGUF {
             .map(|x| x as usize)
             .unwrap_or(4);
 
-        let shared_expert_intermediate = c
-            .get_value::<u32>("expert_shared_feed_forward_length")
-            .ok()
-            .map(|x| x as usize)
-            .unwrap_or_else(|| {
-                c.get_value::<u32>("expert_feed_forward_length")
-                    .map(|x| x as usize)
-                    .unwrap_or(0)
-            });
-
         Ok(Self {
             head_count,
             head_count_kv,
@@ -413,10 +432,8 @@ impl TryFrom<ContentMetadata<'_>> for PropsGGUF {
                 .unwrap_or(DEFAULT_MAX_SEQ_LEN as u64) as usize,
             rope_freq_base: c.get_value("rope.freq_base").ok().unwrap_or(10_000_000_f32),
             head_dim,
-            num_experts: c.get_value::<u32>("expert_count")? as usize,
-            num_experts_per_tok: c.get_value::<u32>("expert_used_count")? as usize,
-            expert_intermediate_size: c.get_value::<u32>("expert_feed_forward_length")? as usize,
-            shared_expert_intermediate_size: shared_expert_intermediate,
+            num_experts: c.get_value::<u32>("expert_count").ok().map(|x| x as usize),
+            num_experts_per_tok: c.get_value::<u32>("expert_used_count").ok().map(|x| x as usize),
             linear_num_k_heads,
             linear_num_v_heads,
             linear_head_k_dim,
@@ -637,45 +654,59 @@ impl ModelConfig::FromGGUF for ModelWeights {
                 props.rms_norm_eps,
             )?;
 
-            // --- MoE (every layer has MoE in Qwen3.5) ---
-            let gate = ct.tensor(&format!("{prefix}.ffn_gate_inp.weight"), device)?;
-            let gate_experts = ct.tensor(&format!("{prefix}.ffn_gate_exps.weight"), device)?;
-            let up_experts = ct.tensor(&format!("{prefix}.ffn_up_exps.weight"), device)?;
-            let down_experts = ct.tensor(&format!("{prefix}.ffn_down_exps.weight"), device)?;
+            // --- FFN: MoE or dense MLP ---
+            let ffn = if ct.has_tensor(&format!("{prefix}.ffn_gate_inp.weight")) {
+                // MoE variant (Qwen3.5 MoE models)
+                let gate = ct.tensor(&format!("{prefix}.ffn_gate_inp.weight"), device)?;
+                let gate_experts = ct.tensor(&format!("{prefix}.ffn_gate_exps.weight"), device)?;
+                let up_experts = ct.tensor(&format!("{prefix}.ffn_up_exps.weight"), device)?;
+                let down_experts = ct.tensor(&format!("{prefix}.ffn_down_exps.weight"), device)?;
 
-            let sparse_moe = FusedMoe {
-                gate: QMatMul::from_qtensor(gate)?,
-                gate_experts: QMatMul::from_qtensor(gate_experts)?,
-                up_experts: QMatMul::from_qtensor(up_experts)?,
-                down_experts: QMatMul::from_qtensor(down_experts)?,
-                norm_topk_prob: true,
-                num_experts_per_tok: props.num_experts_per_tok,
-            };
+                let sparse_moe = FusedMoe {
+                    gate: QMatMul::from_qtensor(gate)?,
+                    gate_experts: QMatMul::from_qtensor(gate_experts)?,
+                    up_experts: QMatMul::from_qtensor(up_experts)?,
+                    down_experts: QMatMul::from_qtensor(down_experts)?,
+                    norm_topk_prob: true,
+                    num_experts_per_tok: props.num_experts_per_tok.unwrap_or(4),
+                };
 
-            // Shared expert
-            let shared_gate_proj = ct.tensor(&format!("{prefix}.ffn_gate_shexp.weight"), device)?;
-            let shared_up_proj = ct.tensor(&format!("{prefix}.ffn_up_shexp.weight"), device)?;
-            let shared_down_proj = ct.tensor(&format!("{prefix}.ffn_down_shexp.weight"), device)?;
-            let shared_gate_qt = ct.tensor(&format!("{prefix}.ffn_gate_inp_shexp.weight"), device)?;
-            let shared_gate_w = shared_gate_qt.dequantize(device)?
-                .reshape((1, props.embedding_length))?;
-            let shared_gate = candle_nn::Linear::new(shared_gate_w, None);
+                // Shared expert
+                let shared_gate_proj = ct.tensor(&format!("{prefix}.ffn_gate_shexp.weight"), device)?;
+                let shared_up_proj = ct.tensor(&format!("{prefix}.ffn_up_shexp.weight"), device)?;
+                let shared_down_proj = ct.tensor(&format!("{prefix}.ffn_down_shexp.weight"), device)?;
+                let shared_gate_qt = ct.tensor(&format!("{prefix}.ffn_gate_inp_shexp.weight"), device)?;
+                let shared_gate_w = shared_gate_qt.dequantize(device)?
+                    .reshape((1, props.embedding_length))?;
+                let shared_gate = candle_nn::Linear::new(shared_gate_w, None);
 
-            let shared_expert = SharedExpert {
-                gate_proj: gguf_matmul(shared_gate_proj)?,
-                up_proj: gguf_matmul(shared_up_proj)?,
-                down_proj: gguf_matmul(shared_down_proj)?,
-                shared_gate,
+                FfnBlock::Moe(MoeBlock {
+                    sparse_moe,
+                    shared_expert: SharedExpert {
+                        gate_proj: gguf_matmul(shared_gate_proj)?,
+                        up_proj: gguf_matmul(shared_up_proj)?,
+                        down_proj: gguf_matmul(shared_down_proj)?,
+                        shared_gate,
+                    },
+                })
+            } else {
+                // Dense MLP variant (Qwen3.5 dense models like 9B)
+                let gate_proj = ct.tensor(&format!("{prefix}.ffn_gate.weight"), device)?;
+                let up_proj = ct.tensor(&format!("{prefix}.ffn_up.weight"), device)?;
+                let down_proj = ct.tensor(&format!("{prefix}.ffn_down.weight"), device)?;
+
+                FfnBlock::Dense(DenseMlp {
+                    gate_proj: gguf_matmul(gate_proj)?,
+                    up_proj: gguf_matmul(up_proj)?,
+                    down_proj: gguf_matmul(down_proj)?,
+                })
             };
 
             layers.push(DecoderLayer {
                 layer_impl,
                 attn_norm,
                 ffn_norm,
-                moe: MoeBlock {
-                    sparse_moe,
-                    shared_expert,
-                },
+                ffn,
             });
         }
 
@@ -811,8 +842,8 @@ impl ModelWeights {
                 .map_err(|e| candle_core::Error::Msg(format!("layer {i} attn_residual: {e}")))?;
             let residual = &x;
             let x = layer.ffn_norm.forward(&x)?;
-            let x = layer.moe.forward(&x)
-                .map_err(|e| candle_core::Error::Msg(format!("layer {i} moe: {e}")))?;
+            let x = layer.ffn.forward(&x)
+                .map_err(|e| candle_core::Error::Msg(format!("layer {i} ffn: {e}")))?;
             layer_in = (x + residual)
                 .map_err(|e| candle_core::Error::Msg(format!("layer {i} moe_residual: {e}")))?;
         }
