@@ -594,11 +594,21 @@ impl ModelConfig::FromGGUF for ModelWeights {
                 let ssm_a_deq = ssm_a.dequantize(device)?;
                 let a_log = ssm_a_deq.neg()?.log()?.to_dtype(dtype)?;
                 let dt_bias = dt_bias_t.dequantize(device)?.to_dtype(dtype)?;
-                // GGUF stores conv1d as (kernel_size, conv_dim); transpose to (conv_dim, 1, kernel_size)
-                // to match the expected layout for causal_conv1d.
-                let conv_w_raw = conv1d_weight.dequantize(device)?.to_dtype(dtype)?;
-                let conv_w = conv_w_raw.t()?.unsqueeze(1)?.contiguous()?;
+                let conv_w = conv1d_weight.dequantize(device)?.to_dtype(dtype)?;
                 let norm_w = ssm_norm.dequantize(device)?.to_dtype(dtype)?;
+
+                if layer_idx == 0 {
+                    tracing::info!(
+                        conv_w_shape = ?conv_w.shape(),
+                        norm_w_shape = ?norm_w.shape(),
+                        a_log_shape = ?a_log.shape(),
+                        dt_bias_shape = ?dt_bias.shape(),
+                        key_dim = key_dim,
+                        value_dim = value_dim,
+                        conv_dim = conv_dim,
+                        "gdn_layer0_shapes"
+                    );
+                }
 
                 // MoE models use tiled V-head layout in GGUF; dense models use interleaved.
                 let is_moe = props.num_experts.is_some();
