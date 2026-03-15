@@ -269,6 +269,10 @@ pub struct GatedDeltaNet {
     pub conv_kernel_size: usize,
     pub key_dim: usize,
     pub value_dim: usize,
+    /// If true, V-head expansion uses tiled layout [K0..K15, K0..K15].
+    /// If false, uses interleaved layout [K0, K0, K1, K1, ...].
+    /// MoE models use tiled; dense models use interleaved.
+    pub tiled_v_heads: bool,
 }
 
 impl GatedDeltaNet {
@@ -396,6 +400,8 @@ impl GatedDeltaNet {
             conv_kernel_size,
             key_dim,
             value_dim,
+            // HF/safetensor FusedQkvzBa path uses interleaved layout
+            tiled_v_heads: false,
         })
     }
 
@@ -568,6 +574,8 @@ impl GatedDeltaNet {
             conv_kernel_size,
             key_dim,
             value_dim,
+            // HF/safetensor path uses interleaved layout
+            tiled_v_heads: false,
         })
     }
 
@@ -721,18 +729,32 @@ impl GatedDeltaNet {
         // 5. Compute beta and g (3D: batch, seq, num_v_heads)
         let (beta, g) = self.compute_gating(&b, &a, dtype)
             .map_err(|e| candle_core::Error::Msg(format!("gdn compute_gating: {e}")))?;
-        // 6. If num_v_heads > num_k_heads, tile-repeat q and k.
-        // GGUF uses tiled V-head layout: [K0..K15, K0..K15] (NOT interleaved
-        // [K0,K0,K1,K1,...]).  unsqueeze(2) + broadcast gives tiled order.
+        // 6. If num_v_heads > num_k_heads, expand q and k to match V-head count.
+        // Layout depends on GGUF weight ordering:
+        //   Tiled:       [K0..K15, K0..K15] → unsqueeze(2) before num_k_heads
+        //   Interleaved: [K0,K0, K1,K1,...] → unsqueeze(3) after num_k_heads
         let (q, k) = if v_per_group > 1 {
-            let q = q
-                .unsqueeze(2)?
-                .broadcast_as((batch_size, seq_len, v_per_group, self.num_k_heads, self.head_k_dim))?
-                .reshape((batch_size, seq_len, self.num_v_heads, self.head_k_dim))?;
-            let k = k
-                .unsqueeze(2)?
-                .broadcast_as((batch_size, seq_len, v_per_group, self.num_k_heads, self.head_k_dim))?
-                .reshape((batch_size, seq_len, self.num_v_heads, self.head_k_dim))?;
+            let (q, k) = if self.tiled_v_heads {
+                let q = q
+                    .unsqueeze(2)?
+                    .broadcast_as((batch_size, seq_len, v_per_group, self.num_k_heads, self.head_k_dim))?
+                    .reshape((batch_size, seq_len, self.num_v_heads, self.head_k_dim))?;
+                let k = k
+                    .unsqueeze(2)?
+                    .broadcast_as((batch_size, seq_len, v_per_group, self.num_k_heads, self.head_k_dim))?
+                    .reshape((batch_size, seq_len, self.num_v_heads, self.head_k_dim))?;
+                (q, k)
+            } else {
+                let q = q
+                    .unsqueeze(3)?
+                    .broadcast_as((batch_size, seq_len, self.num_k_heads, v_per_group, self.head_k_dim))?
+                    .reshape((batch_size, seq_len, self.num_v_heads, self.head_k_dim))?;
+                let k = k
+                    .unsqueeze(3)?
+                    .broadcast_as((batch_size, seq_len, self.num_k_heads, v_per_group, self.head_k_dim))?
+                    .reshape((batch_size, seq_len, self.num_v_heads, self.head_k_dim))?;
+                (q, k)
+            };
             (q, k)
         } else {
             (q, k)
