@@ -845,8 +845,11 @@ impl ModelWeights {
                 LayerImpl::LinearAttention(gdn) => {
                     if let LocalLayerCache::LinearAttention(ref mut gdn_cache) = local_cache.caches[i]
                     {
-                        gdn.forward(&x, gdn_cache)
-                            .map_err(|e| candle_core::Error::Msg(format!("layer {i} gdn: {e}")))?
+                        // DEBUG: bypass GDN to isolate bug
+                        let _ = gdn_cache;
+                        Tensor::zeros_like(&x)?
+                        // gdn.forward(&x, gdn_cache)
+                        //     .map_err(|e| candle_core::Error::Msg(format!("layer {i} gdn: {e}")))?
                     } else {
                         candle_core::bail!("Expected GDN cache for linear attention layer {i}");
                     }
