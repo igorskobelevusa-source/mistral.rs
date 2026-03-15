@@ -610,8 +610,7 @@ impl ModelConfig::FromGGUF for ModelWeights {
                     );
                 }
 
-                // MoE models use tiled V-head layout in GGUF; dense models use interleaved.
-                let is_moe = props.num_experts.is_some();
+                // GGUF stores V-heads in tiled layout for both MoE and dense Qwen3.5.
                 let gdn = GatedDeltaNet {
                     projection: GdnProjection::SplitQkvZa {
                         in_proj_qkv: gguf_matmul(in_proj_qkv)?,
@@ -634,7 +633,7 @@ impl ModelConfig::FromGGUF for ModelWeights {
                     conv_kernel_size: props.linear_conv_kernel_size,
                     key_dim,
                     value_dim,
-                    tiled_v_heads: is_moe,
+                    tiled_v_heads: true,
                 };
 
                 let cache = GdnLayerCache {
