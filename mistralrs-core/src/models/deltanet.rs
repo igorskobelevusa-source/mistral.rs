@@ -184,11 +184,11 @@ pub fn gated_delta_rule_recurrence(
         let g_t = g.i((.., .., i))?;
         let beta_t = beta.i((.., .., i))?;
 
-        let decay = g_t.exp()?.unsqueeze(D::Minus1)?.unsqueeze(D::Minus1)?;
-        s = s.broadcast_mul(&decay)?;
-
         let k_exp = k_t.unsqueeze(D::Minus1)?;
         let kv_mem = s.broadcast_mul(&k_exp)?.sum(2)?;
+
+        let decay = g_t.exp()?.unsqueeze(D::Minus1)?.unsqueeze(D::Minus1)?;
+        s = s.broadcast_mul(&decay)?;
 
         let beta_exp = beta_t.unsqueeze(D::Minus1)?;
         let delta = (v_t - kv_mem)?.broadcast_mul(&beta_exp)?;
@@ -786,7 +786,7 @@ impl GatedDeltaNet {
     fn compute_gating(&self, b: &Tensor, a: &Tensor, dtype: DType) -> Result<(Tensor, Tensor)> {
         #[cfg(feature = "cuda")]
         {
-            if false && b.device().is_cuda() { // DEBUG: force CPU fallback
+            if b.device().is_cuda() {
                 let b_flat = b.contiguous()?.flatten_all()?;
                 let a_flat = a.contiguous()?.flatten_all()?;
                 let a_log_f32 = self.a_log.to_dtype(DType::F32)?.contiguous()?;
@@ -836,7 +836,7 @@ impl GatedDeltaNet {
     ) -> Result<Tensor> {
         #[cfg(feature = "cuda")]
         {
-            if false && q.device().is_cuda() { // DEBUG: force CPU fallback
+            if q.device().is_cuda() {
                 let num_heads = self.num_v_heads;
                 let k_head = self.head_k_dim;
                 let v_head = self.head_v_dim;
@@ -906,7 +906,7 @@ impl GatedDeltaNet {
         let x_t = x.transpose(1, 2)?.contiguous()?;
 
         #[cfg(feature = "cuda")]
-        if false && x_t.device().is_cuda() { // DEBUG: force CPU fallback
+        if x_t.device().is_cuda() {
             let weight = self
                 .conv1d_weight
                 .squeeze(1)?
@@ -952,7 +952,7 @@ impl GatedDeltaNet {
         let x_t = x.transpose(1, 2)?.contiguous()?;
 
         #[cfg(feature = "cuda")]
-        if false && x_t.device().is_cuda() { // DEBUG: force CPU fallback
+        if x_t.device().is_cuda() {
             let weight = self
                 .conv1d_weight
                 .squeeze(1)?

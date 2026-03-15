@@ -77,12 +77,12 @@ __global__ void gated_delta_rule_recurrence_kernel_tiled(
     float beta_t = beta_bh[t];
     float v_t = v_bh[t * v_dim + v_idx];
 
-    // Fused pass 1: decay state + compute kv_mem
+    // Pass 1: retrieve from un-decayed state, then decay
     float kv_mem = 0.0f;
 #pragma unroll
     for (int j = 0; j < BK; j++) {
-      s[j] *= decay;
       kv_mem = __fmaf_rn(s[j], k_buf[j], kv_mem);
+      s[j] *= decay;
     }
 
     // Delta rule
@@ -160,8 +160,8 @@ __global__ void gated_delta_rule_recurrence_kernel_fallback(
 
     float kv_mem = 0.0f;
     for (int j = 0; j < k_dim; j++) {
-      s[j] *= decay;
       kv_mem = __fmaf_rn(s[j], k_buf[j], kv_mem);
+      s[j] *= decay;
     }
 
     float delta = (v_t - kv_mem) * beta_t;
