@@ -142,9 +142,9 @@ fn fused_moe_metal(weights: &Tensor, x: &Tensor, ids: &Tensor) -> Result<Tensor>
     encoder.set_bytes(7, &input_dim1);
 
     let grid = MTLSize {
-        width: out_features as u64,
-        height: batch as u64,
-        depth: topk as u64,
+        width: out_features as usize,
+        height: batch as usize,
+        depth: topk as usize,
     };
     let threads = MTLSize {
         width: 32,
