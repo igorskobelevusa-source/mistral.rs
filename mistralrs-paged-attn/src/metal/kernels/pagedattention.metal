@@ -922,7 +922,7 @@ template <typename T, typename CACHE_T, int HEAD_SIZE, int BLOCK_SIZE,
         const int offset1 = (vec_idx * VEC_SIZE) / x;
         const int offset2 = (vec_idx * VEC_SIZE) % x;
 
-        if constexpr (is_uchar<CACHE_T>()) {
+        if (is_uchar<CACHE_T>()) {
           // FP8 support
           Quant_vec k_vec_quant = *reinterpret_cast<const device Quant_vec *>(
               k_ptr + offset1 * BLOCK_SIZE * x + offset2);
@@ -1068,7 +1068,7 @@ template <typename T, typename CACHE_T, int HEAD_SIZE, int BLOCK_SIZE,
         // https://github.com/vllm-project/vllm/issues/641#issuecomment-1682544472
         V_vec v_vec;
 
-        if constexpr (is_uchar<CACHE_T>()) {
+        if (is_uchar<CACHE_T>()) {
           // FP8 support
           V_quant_vec v_quant_vec =
               *reinterpret_cast<const device V_quant_vec *>(v_ptr + offset);
