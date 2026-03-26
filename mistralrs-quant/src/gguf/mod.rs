@@ -4,6 +4,8 @@ mod cpu;
 mod cuda;
 #[cfg(feature = "cuda")]
 mod ffi;
+#[cfg(feature = "metal")]
+mod metal;
 
 use std::{
     borrow::Cow,
@@ -79,8 +81,12 @@ impl QuantMethod for GgufMatMul {
         #[cfg(feature = "cuda")]
         let res = cuda::qmatmul_indexed_moe_forward(&self.w, x, indices)?;
 
-        // For CPU and Metal: use dequantize-then-matmul approach
-        #[cfg(not(feature = "cuda"))]
+        // Metal: per-expert dispatch that avoids huge buffer allocations
+        #[cfg(all(feature = "metal", not(feature = "cuda")))]
+        let res = metal::metal_indexed_moe_forward(&self.w, x, indices)?;
+
+        // CPU fallback
+        #[cfg(not(any(feature = "cuda", feature = "metal")))]
         let res = cpu::cpu_indexed_moe_forward(&self.w, x, indices)?;
 
         if let Some(ref b) = self.b {
