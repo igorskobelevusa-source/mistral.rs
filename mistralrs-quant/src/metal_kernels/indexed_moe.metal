@@ -239,7 +239,7 @@ kernel void indexed_moe_forward_q4k(
     }
 }
 
-// BF16 (unquantized/dequantized) variant — for residual/shared expert weights
+// BF16 variant
 kernel void indexed_moe_forward_bf16(
     device const bfloat * all_weights  [[buffer(0)]],   // [n_experts, n, k] in bf16
     device const float  * all_inputs   [[buffer(1)]],   // [batch, hidden] in f32
@@ -265,6 +265,41 @@ kernel void indexed_moe_forward_bf16(
     float sumf = 0.0f;
     for (int i = tiisg; i < MOE_K; i += 32) {
         sumf += (float)w[i] * x[i];
+    }
+
+    sumf = simd_sum(sumf);
+
+    if (tiisg == 0) {
+        all_outputs[task_id * MOE_N + row] = sumf;
+    }
+}
+
+// F32 variant — for dequantized ISQ weights
+kernel void indexed_moe_forward_f32(
+    device const float * all_weights  [[buffer(0)]],
+    device const float * all_inputs   [[buffer(1)]],
+    device const uint  * indices      [[buffer(2)]],
+    device       float * all_outputs  [[buffer(3)]],
+    uint3 tgpig [[threadgroup_position_in_grid]],
+    uint  tiisg [[thread_index_in_simdgroup]],
+    uint  sgitg [[simdgroup_index_in_threadgroup]]
+) {
+    const int row = tgpig.x;
+    const int batch_id = tgpig.y;
+    const int topk_id = tgpig.z;
+    const int task_id = batch_id * MOE_TOPK + topk_id;
+
+    if (row >= MOE_N) return;
+
+    const uint expert_id = indices[task_id];
+    const int input_idx = (MOE_INPUT_DIM1 == 1) ? batch_id : task_id;
+
+    device const float * w = all_weights + (expert_id * MOE_N + row) * MOE_K;
+    device const float * x = all_inputs + input_idx * MOE_K;
+
+    float sumf = 0.0f;
+    for (int i = tiisg; i < MOE_K; i += 32) {
+        sumf += w[i] * x[i];
     }
 
     sumf = simd_sum(sumf);
