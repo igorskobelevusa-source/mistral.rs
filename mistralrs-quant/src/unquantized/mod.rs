@@ -152,50 +152,78 @@ impl QuantMethod for UnquantLinear {
 
         match a.dims() {
             // Metal path: 5D input (b_size, seq_len, 1, 1, hidden_dim)
-            // Process per-expert to avoid materializing a [n*k, out, in] weight tensor
-            // which would be ~67GB for long sequences with 256 experts.
+            // Loop over unique experts and batch their tokens together.
+            // Avoids index_select which creates huge [n, out, in] tensors.
             &[b_size, seq_len, 1, 1, hidden_dim] => {
                 let (_b, _s, num_experts_per_tok) = indices.dims3()?;
                 let n = b_size * seq_len;
-                let a_flat = a.reshape((n, hidden_dim))?;
-                let flat_indices = indices.reshape((n, num_experts_per_tok))?;
+                let a_flat = a.reshape((n, hidden_dim))?; // [n, in]
+                let flat_indices = indices.reshape((n * num_experts_per_tok,))?;
+                let idx_vec: Vec<u32> = flat_indices.to_vec1()?;
 
-                // Process each expert slot independently
-                let mut slot_results = Vec::with_capacity(num_experts_per_tok);
-                for k in 0..num_experts_per_tok {
-                    let slot_ids = flat_indices.i((.., k))?; // [n]
-                    let expert_w = w.index_select(&slot_ids, 0)?; // [n, out, in]
-                    let result = a_flat
-                        .unsqueeze(1)? // [n, 1, in]
-                        .matmul(&expert_w.transpose(1, 2)?)? // [n, 1, out]
-                        .squeeze(1)?; // [n, out]
-                    slot_results.push(result);
+                // Group (token, slot) pairs by expert ID
+                let num_experts = w.dim(0)?;
+                let mut expert_tokens: Vec<Vec<usize>> = vec![Vec::new(); num_experts];
+                for (pair_idx, &expert_id) in idx_vec.iter().enumerate() {
+                    expert_tokens[expert_id as usize].push(pair_idx);
                 }
-                Tensor::stack(&slot_results, 1)? // [n, k, out]
-                    .reshape((b_size, seq_len, num_experts_per_tok, out_features))?
+
+                // Output tensor: [n*k, out]
+                let device = a.device();
+                let dtype = a.dtype();
+                let mut output = Tensor::zeros((n * num_experts_per_tok, out_features), dtype, device)?;
+
+                for (expert_id, pairs) in expert_tokens.iter().enumerate() {
+                    if pairs.is_empty() {
+                        continue;
+                    }
+                    let expert_w = w.i(expert_id)?; // [out, in]
+                    // Gather token vectors for this expert
+                    let tok_ids: Vec<usize> = pairs.iter().map(|&p| p / num_experts_per_tok).collect();
+                    let tok_idx = Tensor::new(tok_ids.iter().map(|&i| i as u32).collect::<Vec<_>>(), device)?;
+                    let tokens = a_flat.index_select(&tok_idx, 0)?; // [batch, in]
+                    let result = tokens.matmul(&expert_w.t()?)?; // [batch, out]
+
+                    // Scatter back
+                    let pair_idx = Tensor::new(pairs.iter().map(|&i| i as u32).collect::<Vec<_>>(), device)?;
+                    output = output.index_add(&pair_idx, &result, 0)?;
+                }
+
+                output.reshape((b_size, seq_len, num_experts_per_tok, out_features))?
             }
             // Metal path: 4D input (b_size, seq_len, num_experts_per_tok, hidden_dim)
             // This is the output shape from gate/up projections fed into down_proj.
-            // Process per-expert slot to avoid huge weight tensor materialization.
+            // Loop over unique experts to avoid huge buffers.
             &[b_size, seq_len, num_experts_per_tok, hidden_dim]
                 if num_experts_per_tok > 1 =>
             {
                 let n = b_size * seq_len;
-                let flat_indices = indices.reshape((n, num_experts_per_tok))?;
+                let flat_indices = indices.reshape((n * num_experts_per_tok,))?;
+                let idx_vec: Vec<u32> = flat_indices.to_vec1()?;
+                let a_flat = a.reshape((n * num_experts_per_tok, hidden_dim))?; // [n*k, in]
 
-                let mut slot_results = Vec::with_capacity(num_experts_per_tok);
-                for k in 0..num_experts_per_tok {
-                    let slot_ids = flat_indices.i((.., k))?; // [n]
-                    let expert_w = w.index_select(&slot_ids, 0)?; // [n, out, in]
-                    let a_slot = a.i((.., .., k, ..))?.reshape((n, hidden_dim))?; // [n, in]
-                    let result = a_slot
-                        .unsqueeze(1)? // [n, 1, in]
-                        .matmul(&expert_w.transpose(1, 2)?)? // [n, 1, out]
-                        .squeeze(1)?; // [n, out]
-                    slot_results.push(result);
+                let num_experts = w.dim(0)?;
+                let mut expert_tokens: Vec<Vec<usize>> = vec![Vec::new(); num_experts];
+                for (pair_idx, &expert_id) in idx_vec.iter().enumerate() {
+                    expert_tokens[expert_id as usize].push(pair_idx);
                 }
-                Tensor::stack(&slot_results, 1)? // [n, k, out]
-                    .reshape((b_size, seq_len, num_experts_per_tok, out_features))?
+
+                let device = a.device();
+                let dtype = a.dtype();
+                let mut output = Tensor::zeros((n * num_experts_per_tok, out_features), dtype, device)?;
+
+                for (expert_id, pairs) in expert_tokens.iter().enumerate() {
+                    if pairs.is_empty() {
+                        continue;
+                    }
+                    let expert_w = w.i(expert_id)?; // [out, in]
+                    let pair_idx = Tensor::new(pairs.iter().map(|&i| i as u32).collect::<Vec<_>>(), device)?;
+                    let tokens = a_flat.index_select(&pair_idx, 0)?; // [batch, in]
+                    let result = tokens.matmul(&expert_w.t()?)?; // [batch, out]
+                    output = output.index_add(&pair_idx, &result, 0)?;
+                }
+
+                output.reshape((b_size, seq_len, num_experts_per_tok, out_features))?
             }
             // CUDA path: 3D input (num_tokens, 1, hidden_dim)
             &[num_tokens, 1, hidden_dim] => {
