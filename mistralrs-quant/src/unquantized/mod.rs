@@ -179,6 +179,23 @@ impl QuantMethod for UnquantLinear {
                 // Reshape back to [b, s, k, out_features]
                 result.reshape((b_size, seq_len, num_experts_per_tok, out_features))
             }
+            // Metal path: 4D input (b_size, seq_len, num_experts_per_tok, hidden_dim)
+            // This is the output shape from gate/up projections fed into down_proj.
+            &[b_size, seq_len, num_experts_per_tok, hidden_dim]
+                if num_experts_per_tok > 1 =>
+            {
+                let flat_indices = indices.reshape((b_size * seq_len * num_experts_per_tok,))?;
+                let selected_w = w.index_select(&flat_indices, 0)?;
+
+                let a_flat = a.reshape((b_size * seq_len * num_experts_per_tok, hidden_dim))?;
+
+                let result = a_flat
+                    .unsqueeze(1)?
+                    .matmul(&selected_w.transpose(1, 2)?)?
+                    .squeeze(1)?;
+
+                result.reshape((b_size, seq_len, num_experts_per_tok, out_features))
+            }
             // CUDA path: 3D input (num_tokens, 1, hidden_dim)
             &[num_tokens, 1, hidden_dim] => {
                 let (_, num_experts_per_tok) = indices.dims2()?;
