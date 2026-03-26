@@ -177,7 +177,8 @@ impl QuantMethod for UnquantLinear {
                     if pairs.is_empty() {
                         continue;
                     }
-                    let expert_w = w.i(expert_id)?; // [out, in]
+                    let eid = Tensor::new(&[expert_id as u32], device)?;
+                    let expert_w = w.index_select(&eid, 0)?.squeeze(0)?; // [out, in]
                     // Gather token vectors for this expert
                     let tok_ids: Vec<usize> = pairs.iter().map(|&p| p / num_experts_per_tok).collect();
                     let tok_idx = Tensor::new(tok_ids.iter().map(|&i| i as u32).collect::<Vec<_>>(), device)?;
@@ -189,7 +190,7 @@ impl QuantMethod for UnquantLinear {
                     output = output.index_add(&pair_idx, &result, 0)?;
                 }
 
-                output.reshape((b_size, seq_len, num_experts_per_tok, out_features))?
+                output.reshape((b_size, seq_len, num_experts_per_tok, out_features))
             }
             // Metal path: 4D input (b_size, seq_len, num_experts_per_tok, hidden_dim)
             // This is the output shape from gate/up projections fed into down_proj.
@@ -216,14 +217,15 @@ impl QuantMethod for UnquantLinear {
                     if pairs.is_empty() {
                         continue;
                     }
-                    let expert_w = w.i(expert_id)?; // [out, in]
+                    let eid = Tensor::new(&[expert_id as u32], device)?;
+                    let expert_w = w.index_select(&eid, 0)?.squeeze(0)?; // [out, in]
                     let pair_idx = Tensor::new(pairs.iter().map(|&i| i as u32).collect::<Vec<_>>(), device)?;
                     let tokens = a_flat.index_select(&pair_idx, 0)?; // [batch, in]
                     let result = tokens.matmul(&expert_w.t()?)?; // [batch, out]
                     output = output.index_add(&pair_idx, &result, 0)?;
                 }
 
-                output.reshape((b_size, seq_len, num_experts_per_tok, out_features))?
+                output.reshape((b_size, seq_len, num_experts_per_tok, out_features))
             }
             // CUDA path: 3D input (num_tokens, 1, hidden_dim)
             &[num_tokens, 1, hidden_dim] => {
