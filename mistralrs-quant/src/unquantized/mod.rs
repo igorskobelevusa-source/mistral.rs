@@ -152,49 +152,50 @@ impl QuantMethod for UnquantLinear {
 
         match a.dims() {
             // Metal path: 5D input (b_size, seq_len, 1, 1, hidden_dim)
+            // Process per-expert to avoid materializing a [n*k, out, in] weight tensor
+            // which would be ~67GB for long sequences with 256 experts.
             &[b_size, seq_len, 1, 1, hidden_dim] => {
                 let (_b, _s, num_experts_per_tok) = indices.dims3()?;
-                // Flatten indices to select experts
-                let flat_indices = indices.reshape((b_size * seq_len * num_experts_per_tok,))?;
+                let n = b_size * seq_len;
+                let a_flat = a.reshape((n, hidden_dim))?;
+                let flat_indices = indices.reshape((n, num_experts_per_tok))?;
 
-                // Select expert weights: [b*s*k, out_features, in_features]
-                let selected_w = w.index_select(&flat_indices, 0)?;
-
-                // Reshape input: [b*s, hidden_dim]
-                let a_flat = a.reshape((b_size * seq_len, hidden_dim))?;
-
-                // For each token, we need to compute with each selected expert
-                // Broadcast a to match: [b*s, 1, hidden_dim] -> [b*s, k, hidden_dim]
-                let a_expanded = a_flat
-                    .unsqueeze(1)?
-                    .broadcast_as((b_size * seq_len, num_experts_per_tok, hidden_dim))?
-                    .reshape((b_size * seq_len * num_experts_per_tok, hidden_dim))?;
-
-                // Matmul: [b*s*k, hidden_dim] @ [b*s*k, hidden_dim, out_features] -> [b*s*k, out_features]
-                let result = a_expanded
-                    .unsqueeze(1)?
-                    .matmul(&selected_w.transpose(1, 2)?)?
-                    .squeeze(1)?;
-
-                // Reshape back to [b, s, k, out_features]
-                result.reshape((b_size, seq_len, num_experts_per_tok, out_features))
+                // Process each expert slot independently
+                let mut slot_results = Vec::with_capacity(num_experts_per_tok);
+                for k in 0..num_experts_per_tok {
+                    let slot_ids = flat_indices.i((.., k))?; // [n]
+                    let expert_w = w.index_select(&slot_ids, 0)?; // [n, out, in]
+                    let result = a_flat
+                        .unsqueeze(1)? // [n, 1, in]
+                        .matmul(&expert_w.transpose(1, 2)?)? // [n, 1, out]
+                        .squeeze(1)?; // [n, out]
+                    slot_results.push(result);
+                }
+                Tensor::stack(&slot_results, 1)? // [n, k, out]
+                    .reshape((b_size, seq_len, num_experts_per_tok, out_features))?
             }
             // Metal path: 4D input (b_size, seq_len, num_experts_per_tok, hidden_dim)
             // This is the output shape from gate/up projections fed into down_proj.
+            // Process per-expert slot to avoid huge weight tensor materialization.
             &[b_size, seq_len, num_experts_per_tok, hidden_dim]
                 if num_experts_per_tok > 1 =>
             {
-                let flat_indices = indices.reshape((b_size * seq_len * num_experts_per_tok,))?;
-                let selected_w = w.index_select(&flat_indices, 0)?;
+                let n = b_size * seq_len;
+                let flat_indices = indices.reshape((n, num_experts_per_tok))?;
 
-                let a_flat = a.reshape((b_size * seq_len * num_experts_per_tok, hidden_dim))?;
-
-                let result = a_flat
-                    .unsqueeze(1)?
-                    .matmul(&selected_w.transpose(1, 2)?)?
-                    .squeeze(1)?;
-
-                result.reshape((b_size, seq_len, num_experts_per_tok, out_features))
+                let mut slot_results = Vec::with_capacity(num_experts_per_tok);
+                for k in 0..num_experts_per_tok {
+                    let slot_ids = flat_indices.i((.., k))?; // [n]
+                    let expert_w = w.index_select(&slot_ids, 0)?; // [n, out, in]
+                    let a_slot = a.i((.., .., k, ..))?.reshape((n, hidden_dim))?; // [n, in]
+                    let result = a_slot
+                        .unsqueeze(1)? // [n, 1, in]
+                        .matmul(&expert_w.transpose(1, 2)?)? // [n, 1, out]
+                        .squeeze(1)?; // [n, out]
+                    slot_results.push(result);
+                }
+                Tensor::stack(&slot_results, 1)? // [n, k, out]
+                    .reshape((b_size, seq_len, num_experts_per_tok, out_features))?
             }
             // CUDA path: 3D input (num_tokens, 1, hidden_dim)
             &[num_tokens, 1, hidden_dim] => {
