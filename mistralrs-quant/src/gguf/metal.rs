@@ -117,41 +117,41 @@ fn fused_moe_metal(weights: &Tensor, x: &Tensor, ids: &Tensor) -> Result<Tensor>
 
     let output = Tensor::zeros((batch * topk, out_features), DType::F32, x.device())?;
 
-    let pipeline = load_pipeline(dev.device(), "indexed_moe_forward_f32")?;
+    // Per-expert dispatch using candle's optimized Metal GEMM.
+    // This is faster than our custom kernel because candle uses simdgroup_matrix_multiply.
+    // Dequantize once (1GB), then slice per expert and batch-matmul.
+    let idx_vec: Vec<u32> = flat_ids.to_vec1()?;
 
-    let (w_buf, w_off) = metal_buffer_and_offset(&weights)?;
-    let (x_buf, x_off) = metal_buffer_and_offset(&x_flat)?;
-    let (id_buf, id_off) = metal_buffer_and_offset(&flat_ids)?;
-    let (out_buf, out_off) = metal_buffer_and_offset(&output)?;
+    let mut expert_tokens: Vec<Vec<usize>> = vec![Vec::new(); _num_experts];
+    for (pair_idx, &expert_id) in idx_vec.iter().enumerate() {
+        expert_tokens[expert_id as usize].push(pair_idx);
+    }
 
-    let n_out = out_features as i32;
-    let k_in = in_features as i32;
-    let topk_i32 = topk as i32;
+    let mut output = Tensor::zeros((batch * topk, out_features), DType::F32, x.device())?;
 
-    let encoder = dev.command_encoder()?;
-    let encoder: &ComputeCommandEncoder = encoder.as_ref();
-    encoder.set_compute_pipeline_state(&pipeline);
+    for (expert_id, pairs) in expert_tokens.iter().enumerate() {
+        if pairs.is_empty() {
+            continue;
+        }
+        let eid = Tensor::new(&[expert_id as u32], x.device())?;
+        let expert_w = weights.index_select(&eid, 0)?.squeeze(0)?; // [out, in]
 
-    encoder.set_buffer(0, Some(&w_buf), w_off);
-    encoder.set_buffer(1, Some(&x_buf), x_off);
-    encoder.set_buffer(2, Some(&id_buf), id_off);
-    encoder.set_buffer(3, Some(&out_buf), out_off);
-    encoder.set_bytes(4, &n_out);
-    encoder.set_bytes(5, &k_in);
-    encoder.set_bytes(6, &topk_i32);
-    encoder.set_bytes(7, &input_dim1);
+        // Gather input tokens for this expert
+        let input_ids: Vec<u32> = if input_dim1 == 1 {
+            pairs.iter().map(|&p| (p / topk) as u32).collect()
+        } else {
+            pairs.iter().map(|&p| p as u32).collect()
+        };
+        let tok_idx = Tensor::new(input_ids, x.device())?;
+        let tokens = x_flat.index_select(&tok_idx, 0)?; // [batch_for_expert, in]
 
-    let grid = MTLSize {
-        width: out_features as usize,
-        height: batch as usize,
-        depth: topk as usize,
-    };
-    let threads = MTLSize {
-        width: 32,
-        height: 1,
-        depth: 1,
-    };
-    encoder.dispatch_thread_groups(grid, threads);
+        // Batch matmul via candle's optimized Metal GEMM
+        let result = tokens.matmul(&expert_w.t()?)?; // [batch_for_expert, out]
+
+        // Scatter results back
+        let pair_idx = Tensor::new(pairs.iter().map(|&i| i as u32).collect::<Vec<_>>(), x.device())?;
+        output = output.index_add(&pair_idx, &result, 0)?;
+    }
 
     // Reshape output to match expected shape
     match orig_dims.as_slice() {
