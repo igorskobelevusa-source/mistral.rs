@@ -1,8 +1,13 @@
 mod default_scheduler;
+mod token_scheduler;
 
 use std::sync::Arc;
 
 pub use default_scheduler::{DefaultScheduler, DefaultSchedulerMethod, DefaultSchedulerOutput};
+pub use token_scheduler::{
+    IterationBatch, PrefillChunk, SchedulerSequence, SequenceId, TokenScheduler, UserStats,
+    PREFILL_CHUNK_SIZE, MAX_DECODE_BATCH,
+};
 use tokio::sync::Mutex;
 
 use crate::{
@@ -23,6 +28,8 @@ pub enum SchedulerConfig {
         max_num_seqs: usize,
         config: CacheConfig,
     },
+    /// Token-level continuous batching scheduler with fairness.
+    TokenScheduler,
 }
 
 impl SchedulerConfig {
@@ -38,6 +45,9 @@ impl SchedulerConfig {
                 PagedAttentionSchedulerConfig { max_num_seqs },
                 config,
             ))),
+            Self::TokenScheduler => {
+                Arc::new(Mutex::new(TokenScheduler::new()))
+            }
         }
     }
 }
