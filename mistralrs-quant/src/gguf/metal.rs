@@ -171,7 +171,9 @@ fn dispatch_tiled_moe(
     // Build routing table
     let mut expert_pairs: Vec<Vec<(u32, u32)>> = vec![Vec::new(); n_experts]; // (tok_idx, pair_idx)
     for (pair_idx, &eid) in idx_vec.iter().enumerate() {
-        let tok_idx = if input_dim1 == 1 { pair_idx / topk } else { pair_idx };
+        // tok_idx is always the token index (not the flat pair index)
+        // The kernel uses nb12*id[1] + nb11*(id[0]%ne11) for input addressing
+        let tok_idx = pair_idx / topk;
         expert_pairs[eid as usize].push((tok_idx as u32, pair_idx as u32));
     }
 
