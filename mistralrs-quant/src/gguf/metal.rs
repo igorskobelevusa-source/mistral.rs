@@ -123,11 +123,10 @@ fn dispatch_quantized_moe(qtensor: &Arc<QTensor>, x: &Tensor, ids: &Tensor) -> R
 
     let (x_buf, _x_off) = metal_buffer_and_offset(&x_flat)?;
 
-    // Output: [batch * topk, n_out] — zero-initialized
-    let output = Tensor::zeros((batch * topk, n_out), DType::F32, x.device())?;
-    let (out_buf, _out_off) = metal_buffer_and_offset(&output)?;
+    // Phase 2: Dispatch per expert, collect results
+    let mut all_results: Vec<Tensor> = Vec::new();
+    let mut all_indices: Vec<u32> = Vec::new();
 
-    // Phase 2: Dispatch per expert
     for (expert_id, pairs) in expert_pairs.iter().enumerate() {
         if pairs.is_empty() {
             continue;
@@ -152,7 +151,6 @@ fn dispatch_quantized_moe(qtensor: &Arc<QTensor>, x: &Tensor, ids: &Tensor) -> R
         // Weight offset for this expert
         let w_off = expert_id * expert_bytes;
 
-        // kernel_mul_mv params: weight is src0 (rhs in candle), input is src1 (lhs)
         let ne00 = n_in as i64;
         let ne01 = n_out as i64;
         let ne02 = 1i64;
@@ -200,15 +198,15 @@ fn dispatch_quantized_moe(qtensor: &Arc<QTensor>, x: &Tensor, ids: &Tensor) -> R
         encoder.use_resource(&eout_buf, MTLResourceUsage::Write);
         encoder.dispatch_thread_groups(tg, tpg);
 
-        // Scatter results into output
-        let pair_tensor = Tensor::new(
-            pairs.iter().map(|&i| i as u32).collect::<Vec<_>>(),
-            x.device(),
-        )?;
-        // index_add accumulates expert_out into output at the pair positions
-        // Note: output starts as zeros, each pair is written exactly once
-        let _ = output.index_add(&pair_tensor, &expert_out, 0)?;
+        all_results.push(expert_out);
+        all_indices.extend(pairs.iter().map(|&i| i as u32));
     }
+
+    // Scatter all expert results into output in one pass
+    let all_out = Tensor::cat(&all_results, 0)?;
+    let scatter_idx = Tensor::new(all_indices, x.device())?;
+    let output = Tensor::zeros((batch * topk, n_out), DType::F32, x.device())?;
+    let output = output.index_add(&scatter_idx, &all_out, 0)?;
 
     // Reshape
     match x.dims() {
