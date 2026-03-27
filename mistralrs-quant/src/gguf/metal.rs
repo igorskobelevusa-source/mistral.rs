@@ -30,13 +30,8 @@ fn metal_buffer_and_offset(tensor: &Tensor) -> Result<(Buffer, usize)> {
 
 /// Get the raw Metal buffer from a QTensor without dequantizing.
 fn qtensor_metal_buffer(qtensor: &QTensor) -> Result<(Buffer, GgmlDType)> {
-    let storage = qtensor.storage();
-    match storage {
-        candle_core::quantized::QStorage::Metal(metal_storage) => {
-            Ok((metal_storage.buffer().clone(), qtensor.dtype()))
-        }
-        _ => candle_core::bail!("Expected Metal QTensor storage"),
-    }
+    let metal_storage = qtensor.metal_storage()?;
+    Ok((metal_storage.buffer().clone(), qtensor.dtype()))
 }
 
 /// Metal indexed MoE forward — dispatches candle's fused kernel.
