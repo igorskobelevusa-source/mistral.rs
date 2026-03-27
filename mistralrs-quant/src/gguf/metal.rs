@@ -98,104 +98,85 @@ fn dispatch_quantized_moe(qtensor: &Arc<QTensor>, x: &Tensor, ids: &Tensor) -> R
     let (id_buf, id_off) = metal_buffer_and_offset(&flat_ids)?;
     let (out_buf, out_off) = metal_buffer_and_offset(&output)?;
 
-    // Kernel parameters matching kernel_mul_mv_id signature
+    // Kernel parameters for kernel_mul_mm_id (tiled matrix multiply)
     let nei0 = topk as i64;        // experts per token
     let nei1 = batch as i64;       // number of tokens
     let nbi1 = (topk * 4) as u64;  // stride of ids in bytes (u32 = 4 bytes)
 
-    let ne00 = n_in as i64;        // input dim (K)
-    let ne01 = n_out as i64;       // output dim (N)
-    let ne02 = 1i64;               // batch dim in weights
+    let ne00 = n_in as i64;        // input dim (K) — columns of weight
+    let ne02 = n_experts as i64;   // number of experts
 
     // Byte strides for weights
     let block_size = ggml_dtype.block_size();
     let type_size = ggml_dtype.type_size();
-    let nb00 = type_size as u64;
     let blocks_per_row = n_in / block_size;
     let nb01 = (blocks_per_row * type_size) as u64;  // bytes per weight row
     let nb02 = (n_out as u64) * nb01;                 // bytes per expert
 
-    let ne10 = n_in as i64;
-    // For 5D/3D input: ne11=1 (broadcast same token to all expert slots)
-    // For 4D input: ne11=topk (each expert slot has its own input)
-    let ne11 = input_dim1 as i64;
+    // Input params
+    let ne11 = input_dim1 as i64;  // 1 for broadcast, topk for per-slot
     let ne12 = 1i64;
     let ne13 = 1i64;
-    let nb10 = 4u64;               // f32 = 4 bytes
+    let nb10 = 4u64;               // f32 = 4 bytes per element
     let nb11 = (n_in * 4) as u64;  // bytes per input row
-    let nb12 = (input_dim1 as u64) * nb11;  // bytes per token group
+    let nb12 = (input_dim1 as u64) * nb11;
 
+    // Output
     let ne0 = n_out as i64;
-    let ne1 = topk as i64;  // output stride: dst[expert_slot * ne0 + token * ne1 * ne0]
+    let ne1 = topk as i64;
     let nb1 = (n_out * 4) as u64;
-
-    // Thread group config for Q4_K
-    let (nth0, nth1, align) = match ggml_dtype {
-        GgmlDType::Q4K => (4usize, 8usize, 4usize),
-        GgmlDType::Q2K => (2, 32, 4),
-        GgmlDType::Q3K | GgmlDType::Q5K => (2, 32, 4),
-        GgmlDType::Q6K => (2, 32, 2),
-        GgmlDType::Q8_0 => (8, 8, 8),
-        _ => (32, 1, 8),
-    };
-
-    let kernel_name = match ggml_dtype {
-        GgmlDType::Q4K => "kernel_mul_mv_id_q4_K_f32",
-        GgmlDType::Q2K => "kernel_mul_mv_id_q2_K_f32",
-        GgmlDType::Q3K => "kernel_mul_mv_id_q3_K_f32",
-        GgmlDType::Q5K => "kernel_mul_mv_id_q5_K_f32",
-        GgmlDType::Q6K => "kernel_mul_mv_id_q6_K_f32",
-        GgmlDType::Q8_0 => "kernel_mul_mv_id_q8_0_f32",
-        dt => candle_core::bail!("Unsupported GGML dtype for Metal MoE: {dt:?}"),
-    };
 
     fn divide(m: usize, n: usize) -> usize {
         (m + n - 1) / n
     }
 
+    let kernel_name = match ggml_dtype {
+        GgmlDType::Q4K => "kernel_mul_mm_id_q4_K_f32",
+        GgmlDType::Q2K => "kernel_mul_mm_id_q2_K_f32",
+        GgmlDType::Q3K => "kernel_mul_mm_id_q3_K_f32",
+        GgmlDType::Q6K => "kernel_mul_mm_id_q6_K_f32",
+        GgmlDType::Q4_0 => "kernel_mul_mm_id_q4_0_f32",
+        GgmlDType::Q8_0 => "kernel_mul_mm_id_q8_0_f32",
+        dt => candle_core::bail!("Unsupported GGML dtype for Metal MoE mm: {dt:?}"),
+    };
+
+    // mm_id grid: width=ceil(ne11/32), height=ceil(n_out/64), depth=n_experts
+    // Each z-group handles one expert and scans all tokens for that expert
     let thread_groups = MTLSize {
-        width: divide(n_out, align),
-        height: 1, // one token per dispatch in _id mode
-        depth: (topk * batch) as usize,
+        width: divide(nei1 as usize, 32).max(1),
+        height: divide(n_out, 64),
+        depth: n_experts,
     };
     let threads_per_group = MTLSize {
-        width: nth0,
-        height: nth1,
+        width: 128,  // 4 simdgroups
+        height: 1,
         depth: 1,
     };
 
     let pipeline = dev
         .kernels()
         .load_pipeline(dev.device(), Source::Quantized, kernel_name)
-        .map_err(|e| candle_core::Error::Msg(format!("MoE kernel load failed: {e}")))?;
+        .map_err(|e| candle_core::Error::Msg(format!("MoE mm kernel load failed: {e}")))?;
 
     let encoder = dev.command_encoder()?;
     let encoder: &ComputeCommandEncoder = encoder.as_ref();
     encoder.set_compute_pipeline_state(&pipeline);
 
-    // Buffer layout for kernel_mul_mv_id:
-    // 0: src0s (all expert weights)
-    // 1: src1 (input tokens)
-    // 2: dst (output)
-    // 3: ids (expert indices)
-    // 4+: scalar args
+    // Buffer layout for kernel_mul_mm_id:
     set_params!(
         encoder,
         (
-            (&w_buf, 0usize),     // src0s
-            (&x_buf, x_off),      // src1
-            (&out_buf, out_off),   // dst
-            (&id_buf, id_off),     // ids
+            (&w_buf, 0usize),     // src0s — all expert weights
+            (&x_buf, x_off),      // src1 — input tokens
+            (&out_buf, out_off),   // dst — output
+            (&id_buf, id_off),     // ids — expert indices
             nei0,
             nei1,
             nbi1,
             ne00,
-            ne01,
             ne02,
-            nb00,
             nb01,
             nb02,
-            ne10,
             ne11,
             ne12,
             ne13,
@@ -212,6 +193,11 @@ fn dispatch_quantized_moe(qtensor: &Arc<QTensor>, x: &Tensor, ids: &Tensor) -> R
     encoder.use_resource(&x_buf, MTLResourceUsage::Read);
     encoder.use_resource(&id_buf, MTLResourceUsage::Read);
     encoder.use_resource(&out_buf, MTLResourceUsage::Write);
+
+    // mm_id needs threadgroup memory: 8192 bytes for tiling + rowids
+    // rowids = 4 bytes per (token, slot) pair
+    let rowids_size = (batch * topk * 4) as u64;
+    encoder.set_threadgroup_memory_length(0, (8192 + rowids_size) as u64);
 
     encoder.dispatch_thread_groups(thread_groups, threads_per_group);
 
