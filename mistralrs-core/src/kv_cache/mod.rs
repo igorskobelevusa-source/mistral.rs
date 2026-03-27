@@ -72,8 +72,9 @@ impl KvCache {
     }
 
     pub fn append(&mut self, k: &Tensor, v: &Tensor) -> Result<(Tensor, Tensor)> {
-        let k = k.contiguous()?;
-        let v = v.contiguous()?;
+        // Only make contiguous if needed - avoid copy when tensor is already contiguous
+        let k = if k.is_contiguous() { k.clone() } else { k.contiguous()? };
+        let v = if v.is_contiguous() { v.clone() } else { v.contiguous()? };
         let (out_k, out_v) = match self {
             Self::Normal { k: kc, v: vc } => {
                 kc.append(&k)?;

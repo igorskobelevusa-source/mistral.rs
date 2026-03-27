@@ -167,8 +167,8 @@ fn sinks_attn_cpu(
     mask: Option<&Tensor>,
     sdpa_params: &SdpaParams,
 ) -> Result<Tensor> {
-    let k = repeat_kv(k.clone(), sdpa_params.n_kv_groups)?;
-    let v = repeat_kv(v.clone(), sdpa_params.n_kv_groups)?;
+    let k = repeat_kv(k, sdpa_params.n_kv_groups)?;
+    let v = repeat_kv(v, sdpa_params.n_kv_groups)?;
 
     let att = MatMul.matmul_affine_mul(q, &k.t()?, sdpa_params.softmax_scale.into())?;
     let att = mistralrs_quant::softmax_with_sinks(&att, sinks, mask)?;

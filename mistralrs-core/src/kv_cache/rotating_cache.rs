@@ -1,7 +1,5 @@
 use candle_core::{Result, Tensor};
 
-use super::NormalCache;
-
 #[derive(Debug, Clone)]
 pub struct RotatingCache {
     pub all_data: Option<Tensor>,
@@ -101,42 +99,25 @@ impl RotatingCache {
 
     pub fn append(&mut self, src: &Tensor) -> Result<Tensor> {
         let seq_len = src.dim(self.dim)?;
-        // This doesn't seem very idiomatic but because the creation can fail, it's tricky to use
-        // self.all_data.get_or_insert_with.
+        // Pre-allocate to max_seq_len on first use to avoid repeated reallocation
+        // This matches llama.cpp's approach of allocating full context upfront
         if self.all_data.is_none() {
             let mut shape = src.dims().to_vec();
-            shape[self.dim] = self.capacity_seq_len;
+            // Pre-allocate to max_seq_len (sliding window size) instead of capacity_seq_len
+            // This eliminates all future reallocations during decode
+            shape[self.dim] = self.max_seq_len;
             let ad = Tensor::zeros(shape, src.dtype(), src.device())?;
-            self.all_data = Some(ad)
-        };
-
-        // Expand kv cache, this case is a little more complex.
-        if self.current_seq_len + seq_len > self.capacity_seq_len || self.current_seq_len == 0 {
-            let diff = self.current_seq_len + seq_len.saturating_sub(self.capacity_seq_len);
-            let n_blocks_needed = diff.div_ceil(NormalCache::CACHE_GROW_SIZE);
-            self.capacity_seq_len += n_blocks_needed * NormalCache::CACHE_GROW_SIZE;
-            self.capacity_seq_len = self.capacity_seq_len.min(self.max_seq_len);
-            if self.capacity_seq_len > self.max_seq_len {
-                candle_core::bail!(
-                    "kv-cache: requested capacity ({}) above max seq len ({})",
-                    self.capacity_seq_len,
-                    self.max_seq_len
-                )
-            }
-            let mut shape = src.dims().to_vec();
-            shape[self.dim] = self.capacity_seq_len;
-            let ad = Tensor::zeros(shape, src.dtype(), src.device())?;
-            ad.slice_set(self.all_data.as_ref().unwrap(), self.dim, 0)?;
             self.all_data = Some(ad);
-        }
+            self.capacity_seq_len = self.max_seq_len;
+        };
 
         let ad = self.all_data.as_mut().unwrap();
 
         self.current_seq_len += seq_len;
         if seq_len >= self.max_seq_len {
-            let to_copy = src
-                .narrow(self.dim, seq_len - self.max_seq_len, self.max_seq_len)?
-                .contiguous()?;
+            let narrowed = src.narrow(self.dim, seq_len - self.max_seq_len, self.max_seq_len)?;
+            // Only call contiguous if needed
+            let to_copy = if narrowed.is_contiguous() { narrowed } else { narrowed.contiguous()? };
             ad.slice_set(&to_copy, self.dim, 0)?;
             self.offset = 0;
             // Here we return `src` rather than `ad` so that all the past can be used.
@@ -144,18 +125,20 @@ impl RotatingCache {
         } else {
             let rem_len = self.max_seq_len - self.offset;
             if seq_len <= rem_len {
-                ad.slice_set(&src.contiguous()?, self.dim, self.offset)?;
+                // Only call contiguous if needed - during decode src is usually already contiguous
+                let src_contig = if src.is_contiguous() { src.clone() } else { src.contiguous()? };
+                ad.slice_set(&src_contig, self.dim, self.offset)?;
                 self.offset = (self.offset + seq_len) % self.max_seq_len;
             } else {
                 // We have to make two copies here as we go over the boundary of the cache.
                 if rem_len > 0 {
-                    let src1 = src.narrow(self.dim, 0, rem_len)?.contiguous()?;
-                    ad.slice_set(&src1, self.dim, self.offset)?;
+                    let src1 = src.narrow(self.dim, 0, rem_len)?;
+                    let src1_contig = if src1.is_contiguous() { src1 } else { src1.contiguous()? };
+                    ad.slice_set(&src1_contig, self.dim, self.offset)?;
                 }
-                let src2 = src
-                    .narrow(self.dim, rem_len, seq_len - rem_len)?
-                    .contiguous()?;
-                ad.slice_set(&src2, self.dim, 0)?;
+                let src2 = src.narrow(self.dim, rem_len, seq_len - rem_len)?;
+                let src2_contig = if src2.is_contiguous() { src2 } else { src2.contiguous()? };
+                ad.slice_set(&src2_contig, self.dim, 0)?;
                 self.offset = seq_len - rem_len;
             }
             if self.current_seq_len >= self.max_seq_len {
