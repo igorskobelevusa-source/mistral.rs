@@ -120,8 +120,8 @@ fn dispatch_quantized_moe(qtensor: &Arc<QTensor>, x: &Tensor, ids: &Tensor) -> R
     // Debug: run BOTH kernels and compare
     let debug_tiled = batch > 4 && ggml_dtype == GgmlDType::Q4K;
     if debug_tiled {
-        let tiled_result = dispatch_tiled_moe(dev, w_buf, ggml_dtype, n_experts, n_out, n_in, &x_flat, ids, batch, topk, input_dim1, x.dims());
-        let mvid_result = dispatch_mv_id_moe(dev, w_buf, ggml_dtype, n_experts, n_out, n_in, &x_flat, ids, batch, topk, input_dim1, x.dims());
+        let tiled_result = dispatch_tiled_moe(dev, &w_buf, ggml_dtype, n_experts, n_out, n_in, &x_flat, ids, batch, topk, input_dim1, x.dims());
+        let mvid_result = dispatch_mv_id_moe(dev, &w_buf, ggml_dtype, n_experts, n_out, n_in, &x_flat, ids, batch, topk, input_dim1, x.dims());
         if let (Ok(ref t), Ok(ref m)) = (&tiled_result, &mvid_result) {
             let t_flat = t.flatten_all().and_then(|f| f.to_vec1::<f32>());
             let m_flat = m.flatten_all().and_then(|f| f.to_vec1::<f32>());
