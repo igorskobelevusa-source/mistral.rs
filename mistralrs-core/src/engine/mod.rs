@@ -8,7 +8,7 @@ use crate::{
     },
     prefix_cacher::PrefixCacheManagerV2,
     response::CompletionChoice,
-    scheduler::{Scheduler, SchedulerOutput},
+    scheduler::{IterationBatch, Scheduler, SchedulerOutput, SequenceId},
     search::{self, rag::SearchPipeline},
     sequence::{SeqStepType, StopReason},
     tools, CompletionResponse, SchedulerConfig, DEBUG,
@@ -360,6 +360,132 @@ impl Engine {
 
             let run_start = Instant::now();
             let mut scheduler = get_mut_arcmutex!(self.scheduler);
+
+            // Check if using continuous batching (TokenScheduler)
+            if scheduler.is_continuous_batching() {
+                let batch = match scheduler.schedule_iteration() {
+                    Some(b) => b,
+                    None => {
+                        drop(scheduler);
+                        continue;
+                    }
+                };
+
+                // Handle prefill chunks
+                for chunk in &batch.prefill {
+                    if let Some(seq) = scheduler.get_sequence_mut(chunk.seq_id) {
+                        let chunk_tokens = chunk.end_pos - chunk.start_pos;
+
+                        // Run prefill for this chunk
+                        let mut seqs = vec![seq];
+                        let res = {
+                            let mut pipeline = get_mut_arcmutex!(self.pipeline);
+                            let pre_op = CacheInstruction::Reset {
+                                load_preallocated_cache: true,
+                                reset_non_granular: false,
+                            };
+                            let post_op = if !self.no_kv_cache {
+                                CacheInstruction::Out
+                            } else {
+                                CacheInstruction::Reset {
+                                    load_preallocated_cache: false,
+                                    reset_non_granular: false,
+                                }
+                            };
+                            pipeline
+                                .step(
+                                    &mut seqs,
+                                    true, // is_prompt
+                                    false, // return_raw_logits
+                                    &mut *get_mut_arcmutex!(self.prefix_cacher),
+                                    self.disable_eos_stop,
+                                    rng.clone(),
+                                    CacheBackendMetadata::DefaultInstructions { pre_op, post_op },
+                                )
+                                .await
+                        };
+
+                        if let Err(e) = res {
+                            tracing::error!("Prefill chunk error: {e}");
+                        }
+
+                        self.logger.add_tokens_processed(chunk_tokens);
+                    }
+
+                    // Record prefill progress (after dropping seq borrow)
+                    scheduler.record_prefill_progress(chunk.seq_id, chunk.end_pos - chunk.start_pos);
+                }
+
+                // Handle decode batch
+                if !batch.decode.is_empty() {
+                    // Collect mutable refs for all decode sequences
+                    let mut decode_seqs: Vec<&mut crate::sequence::Sequence> = Vec::new();
+                    let decode_ids = batch.decode.clone();
+
+                    for id in &decode_ids {
+                        if let Some(seq) = scheduler.get_sequence_mut(*id) {
+                            // SAFETY: We're collecting non-overlapping mutable refs
+                            // This is safe because each ID is unique
+                            decode_seqs.push(unsafe { &mut *(seq as *mut _) });
+                        }
+                    }
+
+                    if !decode_seqs.is_empty() {
+                        let current_completion_ids: Vec<usize> =
+                            decode_seqs.iter().map(|seq| *seq.id()).collect();
+
+                        let res = {
+                            let mut pipeline = get_mut_arcmutex!(self.pipeline);
+                            let pre_op = if !self.no_kv_cache
+                                && last_completion_ids != current_completion_ids
+                            {
+                                CacheInstruction::In
+                            } else {
+                                CacheInstruction::Nothing
+                            };
+                            let post_op = if !self.no_kv_cache {
+                                CacheInstruction::Out
+                            } else {
+                                CacheInstruction::Reset {
+                                    load_preallocated_cache: false,
+                                    reset_non_granular: false,
+                                }
+                            };
+
+                            pipeline
+                                .step(
+                                    &mut decode_seqs,
+                                    false, // is_prompt
+                                    false, // return_raw_logits
+                                    &mut *get_mut_arcmutex!(self.prefix_cacher),
+                                    self.disable_eos_stop,
+                                    rng.clone(),
+                                    CacheBackendMetadata::DefaultInstructions { pre_op, post_op },
+                                )
+                                .await
+                        };
+
+                        if let Err(e) = res {
+                            tracing::error!("Decode step error: {e}");
+                        }
+
+                        self.logger.add_tokens_processed(decode_seqs.len());
+                        last_completion_ids = current_completion_ids;
+                    }
+
+                    // Record decode tokens
+                    for id in decode_ids {
+                        scheduler.record_decode_token(id);
+                    }
+                }
+
+                // Cleanup finished sequences
+                scheduler.free_finished_sequence_groups();
+                drop(scheduler);
+                continue;
+            }
+
+            // --- Original scheduling path (DefaultScheduler / PagedAttention) ---
             let scheduled = scheduler.schedule(&self.logger);
 
             match scheduled {

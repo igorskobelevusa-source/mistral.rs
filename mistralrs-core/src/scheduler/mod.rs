@@ -79,4 +79,37 @@ pub trait Scheduler: Send + Sync {
     /// Set whether prefix caching is enabled. Called by Engine after creation
     /// to synchronize with the global no_prefix_cache setting.
     fn set_prefix_caching_enabled(&mut self, enabled: bool);
+
+    // =========================================================================
+    // Continuous batching methods (TokenScheduler)
+    // Default implementations return None/false for non-TokenScheduler.
+    // =========================================================================
+
+    /// Returns true if this scheduler uses continuous batching (iteration-level).
+    fn is_continuous_batching(&self) -> bool {
+        false
+    }
+
+    /// Schedule one iteration of work. Returns (prefill_chunks, decode_ids).
+    /// Only meaningful for continuous batching schedulers.
+    fn schedule_iteration(&mut self) -> Option<IterationBatch> {
+        None
+    }
+
+    /// Get mutable reference to a sequence by ID.
+    fn get_sequence_mut(&mut self, _id: SequenceId) -> Option<&mut Sequence> {
+        None
+    }
+
+    /// Record that prefill progress was made on a sequence.
+    fn record_prefill_progress(&mut self, _id: SequenceId, _tokens: usize) {}
+
+    /// Record that a decode token was generated for a sequence.
+    fn record_decode_token(&mut self, _id: SequenceId) {}
+
+    /// Add a sequence with user ID (for fairness tracking).
+    fn add_seq_with_user(&mut self, seq: Sequence, _user_id: String) {
+        // Default: ignore user_id, just add normally
+        self.add_seq(seq);
+    }
 }

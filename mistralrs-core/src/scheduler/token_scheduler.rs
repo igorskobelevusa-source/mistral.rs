@@ -483,4 +483,32 @@ impl Scheduler for TokenScheduler {
     fn set_prefix_caching_enabled(&mut self, _enabled: bool) {
         // Not using PagedAttention prefix caching
     }
+
+    // =========================================================================
+    // Continuous batching methods
+    // =========================================================================
+
+    fn is_continuous_batching(&self) -> bool {
+        true
+    }
+
+    fn schedule_iteration(&mut self) -> Option<super::IterationBatch> {
+        Some(self.schedule_iteration())
+    }
+
+    fn get_sequence_mut(&mut self, id: super::SequenceId) -> Option<&mut Sequence> {
+        self.get_sequence_mut(id)
+    }
+
+    fn record_prefill_progress(&mut self, id: super::SequenceId, tokens: usize) {
+        self.record_prefill_progress(id, tokens);
+    }
+
+    fn record_decode_token(&mut self, id: super::SequenceId) {
+        self.record_decode_token(id);
+    }
+
+    fn add_seq_with_user(&mut self, seq: Sequence, user_id: String) {
+        self.add_sequence(seq, user_id);
+    }
 }
