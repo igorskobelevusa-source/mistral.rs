@@ -118,7 +118,9 @@ fn dispatch_quantized_moe(qtensor: &Arc<QTensor>, x: &Tensor, ids: &Tensor) -> R
     // For single-token decode, use mv_id (fast for matvec)
     // For prefill (many tokens), use custom tiled kernel
     // Tiled kernel for prefill (simdgroup matmul), mv_id for decode (matvec)
-    let use_tiled = batch > 4 && ggml_dtype == GgmlDType::Q4K;
+    // Tiled kernel wins for long sequences (routing overhead amortized).
+    // For short sequences (< 32 tokens), mv_id is faster.
+    let use_tiled = batch > 32 && ggml_dtype == GgmlDType::Q4K;
 
     if use_tiled {
         dispatch_tiled_moe(dev, &w_buf, ggml_dtype, n_experts, n_out, n_in, &x_flat, ids, batch, topk, input_dim1, x.dims())
