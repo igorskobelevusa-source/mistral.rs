@@ -116,15 +116,17 @@ fn dispatch_quantized_moe(qtensor: &Arc<QTensor>, x: &Tensor, ids: &Tensor) -> R
     let nb02 = (n_out as u64) * nb01;                 // bytes per expert
 
     let ne10 = n_in as i64;
-    let ne11 = 1i64;               // one token at a time per dispatch
+    // For 5D/3D input: ne11=1 (broadcast same token to all expert slots)
+    // For 4D input: ne11=topk (each expert slot has its own input)
+    let ne11 = input_dim1 as i64;
     let ne12 = 1i64;
     let ne13 = 1i64;
     let nb10 = 4u64;               // f32 = 4 bytes
-    let nb11 = (n_in * 4) as u64;  // bytes per token
-    let nb12 = nb11;
+    let nb11 = (n_in * 4) as u64;  // bytes per input row
+    let nb12 = (input_dim1 as u64) * nb11;  // bytes per token group
 
     let ne0 = n_out as i64;
-    let ne1 = 1i64;
+    let ne1 = topk as i64;  // output stride: dst[expert_slot * ne0 + token * ne1 * ne0]
     let nb1 = (n_out * 4) as u64;
 
     // Thread group config for Q4_K
