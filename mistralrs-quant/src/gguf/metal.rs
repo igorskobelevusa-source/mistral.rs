@@ -144,7 +144,8 @@ fn dispatch_quantized_moe(qtensor: &Arc<QTensor>, x: &Tensor, ids: &Tensor) -> R
         }
         return mvid_result;
     }
-    let use_tiled = false;
+    // After debug compare, use tiled for prefill
+    let use_tiled = batch > 4 && ggml_dtype == GgmlDType::Q4K;
 
     if use_tiled {
         dispatch_tiled_moe(dev, &w_buf, ggml_dtype, n_experts, n_out, n_in, &x_flat, ids, batch, topk, input_dim1, x.dims())
