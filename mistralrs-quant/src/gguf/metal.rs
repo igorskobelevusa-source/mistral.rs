@@ -117,12 +117,11 @@ fn dispatch_quantized_moe(qtensor: &Arc<QTensor>, x: &Tensor, ids: &Tensor) -> R
 
     // For single-token decode, use mv_id (fast for matvec)
     // For prefill (many tokens), use custom tiled kernel
-    // TODO: custom tiled kernel has Q4K dequant bug (NaN output).
-    // Use mv_id for all cases until fixed.
-    let use_tiled = false && batch > 1 && ggml_dtype == GgmlDType::Q4K;
+    // Use tiled kernel for prefill (many tokens), mv_id for decode (single token)
+    let use_tiled = batch > 4 && ggml_dtype == GgmlDType::Q4K;
 
     if use_tiled {
-        dispatch_tiled_moe(dev, &w_buf, n_experts, n_out, n_in, &x_flat, ids, batch, topk, input_dim1, x.dims())
+        dispatch_tiled_moe(dev, &w_buf, ggml_dtype, n_experts, n_out, n_in, &x_flat, ids, batch, topk, input_dim1, x.dims())
     } else {
         dispatch_mv_id_moe(dev, &w_buf, ggml_dtype, n_experts, n_out, n_in, &x_flat, ids, batch, topk, input_dim1, x.dims())
     }
@@ -132,6 +131,7 @@ fn dispatch_quantized_moe(qtensor: &Arc<QTensor>, x: &Tensor, ids: &Tensor) -> R
 fn dispatch_tiled_moe(
     dev: &candle_core::MetalDevice,
     w_buf: &Buffer,
+    ggml_dtype: GgmlDType,
     n_experts: usize, n_out: usize, n_in: usize,
     x_flat: &Tensor, ids: &Tensor,
     batch: usize, topk: usize, input_dim1: usize,
@@ -149,10 +149,10 @@ fn dispatch_tiled_moe(
     }
 
     // Build flat routing arrays
+    // rowids = ushort2(expert_slot, token_idx) matching kernel's expected format
     let mut route_counts = vec![0u32; n_experts];
     let mut route_offsets = vec![0u32; n_experts];
-    let mut route_tok_ids = Vec::with_capacity(total_pairs);
-    let mut route_pair_ids = Vec::with_capacity(total_pairs);
+    let mut rowids_flat: Vec<u16> = Vec::with_capacity(total_pairs * 2); // ushort2 = 2 × u16
     let mut max_tokens_per_expert = 0usize;
 
     let mut offset = 0u32;
@@ -160,9 +160,11 @@ fn dispatch_tiled_moe(
         route_counts[eid] = pairs.len() as u32;
         route_offsets[eid] = offset;
         max_tokens_per_expert = max_tokens_per_expert.max(pairs.len());
-        for &(tok, pair) in pairs {
-            route_tok_ids.push(tok);
-            route_pair_ids.push(pair);
+        for &(tok_idx, pair_idx) in pairs {
+            // ushort2: [0] = expert_slot (pair_idx % topk), [1] = token_idx
+            let slot = (pair_idx as usize % topk) as u16;
+            rowids_flat.push(slot);
+            rowids_flat.push(tok_idx as u16);
         }
         offset += pairs.len() as u32;
     }
@@ -171,8 +173,8 @@ fn dispatch_tiled_moe(
     let device = x_flat.device();
     let counts_t = Tensor::new(route_counts, device)?;
     let offsets_t = Tensor::new(route_offsets, device)?;
-    let tok_ids_t = Tensor::new(route_tok_ids, device)?;
-    let pair_ids_t = Tensor::new(route_pair_ids, device)?;
+    // rowids as raw u16 pairs — kernel reads as ushort2
+    let rowids_t = Tensor::new(rowids_flat, device)?;
 
     let x_flat = x_flat.contiguous()?.to_dtype(DType::F32)?;
     let output = Tensor::zeros((total_pairs, n_out), DType::F32, device)?;
@@ -180,12 +182,22 @@ fn dispatch_tiled_moe(
     let (x_buf, x_off) = metal_buffer_and_offset(&x_flat)?;
     let (out_buf, out_off) = metal_buffer_and_offset(&output)?;
     let (cnt_buf, cnt_off) = metal_buffer_and_offset(&counts_t)?;
-    let (tok_buf, tok_off) = metal_buffer_and_offset(&tok_ids_t)?;
-    let (pair_buf, pair_off) = metal_buffer_and_offset(&pair_ids_t)?;
+    let (rid_buf, rid_off) = metal_buffer_and_offset(&rowids_t)?;
     let (off_buf, off_off) = metal_buffer_and_offset(&offsets_t)?;
 
-    let n_out_i32 = n_out as i32;
-    let n_in_i32 = n_in as i32;
+    // Kernel scalar params
+    let block_size = ggml_dtype.block_size();
+    let type_size = ggml_dtype.type_size();
+    let blocks_per_row = n_in / block_size;
+    let nb01 = (blocks_per_row * type_size) as u64;
+
+    let ne00 = n_in as i64;
+    let ne0 = n_out as i64;
+    let ne11 = input_dim1 as i64;  // 1 for broadcast, topk for per-slot
+    let nb10 = 4u64;               // f32 = 4 bytes
+    let nb11 = (n_in * 4) as u64;
+    let nb12 = (input_dim1 as u64) * nb11;
+    let ne0ne1 = (n_out * topk) as i64;  // output stride: ne0 * topk
 
     let pipeline = load_moe_pipeline(dev.device(), "moe_mm_q4k_routed")?;
 
@@ -197,13 +209,17 @@ fn dispatch_tiled_moe(
     encoder.set_buffer(1, Some(&x_buf), x_off);
     encoder.set_buffer(2, Some(&out_buf), out_off);
     encoder.set_buffer(3, Some(&cnt_buf), cnt_off);
-    encoder.set_buffer(4, Some(&tok_buf), tok_off);
-    encoder.set_buffer(5, Some(&pair_buf), pair_off);
-    encoder.set_buffer(6, Some(&off_buf), off_off);
-    encoder.set_bytes(7, &n_out_i32);
-    encoder.set_bytes(8, &n_in_i32);
+    encoder.set_buffer(4, Some(&rid_buf), rid_off);  // ushort2 rowids
+    encoder.set_buffer(5, Some(&off_buf), off_off);
+    encoder.set_bytes(6, &ne00);
+    encoder.set_bytes(7, &ne0);
+    encoder.set_bytes(8, &nb01);
+    encoder.set_bytes(9, &ne11);
+    encoder.set_bytes(10, &nb10);
+    encoder.set_bytes(11, &nb11);
+    encoder.set_bytes(12, &nb12);
+    encoder.set_bytes(13, &ne0ne1);
 
-    // Grid: (ceil(max_tokens/32), ceil(n_out/64), n_experts)
     let grid = MTLSize {
         width: divide(max_tokens_per_expert, 32),
         height: divide(n_out, 64),
@@ -215,8 +231,7 @@ fn dispatch_tiled_moe(
     encoder.use_resource(&x_buf, MTLResourceUsage::Read);
     encoder.use_resource(&out_buf, MTLResourceUsage::Write);
     encoder.use_resource(&cnt_buf, MTLResourceUsage::Read);
-    encoder.use_resource(&tok_buf, MTLResourceUsage::Read);
-    encoder.use_resource(&pair_buf, MTLResourceUsage::Read);
+    encoder.use_resource(&rid_buf, MTLResourceUsage::Read);
     encoder.use_resource(&off_buf, MTLResourceUsage::Read);
 
     encoder.set_threadgroup_memory_length(0, 8192);
