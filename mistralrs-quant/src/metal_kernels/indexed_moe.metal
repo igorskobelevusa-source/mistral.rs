@@ -1,19 +1,23 @@
-// Indexed MoE forward kernel for Metal — Q4_K quantized weights
-// Adapted from candle's kernel_mul_mv_q4_K_f32 with expert index lookup.
-// Each threadgroup computes N_DST output rows for one (token, expert_slot) pair
-// directly on quantized blocks — no dequantization needed.
+// Custom indexed MoE forward kernel for Metal with device-buffer routing.
+// Based on candle's kernel_mul_mm_id but reads routing table from device memory
+// instead of threadgroup memory — eliminates the 32KB threadgroup limit.
 //
-// Grid: (n_rows/N_DST, batch, topk)
-// Threads: (32, 1, 1) — one simdgroup
+// Two-phase:
+// 1. Rust builds per-expert routing table as device buffer
+// 2. This kernel does tiled simdgroup matmul per expert
+//
+// Grid: (ceil(max_tokens_per_expert/32), ceil(n_out/64), n_experts)
+// Threads: 128 (4 simdgroups)
 
 #include <metal_stdlib>
 #include <metal_simdgroup>
+#include <metal_simdgroup_matrix>
 using namespace metal;
 
 #define QK_K 256
 #define K_SCALE_SIZE 12
 
-// GGUF block types
+// Block types
 typedef struct {
     half d;
     half dmin;
@@ -21,166 +25,196 @@ typedef struct {
     uint8_t qs[QK_K/2];
 } block_q4_K;
 
-// Number of output rows per threadgroup
-#define N_DST 4
+// Tiling constants (same as candle/llama.cpp)
+#define BLOCK_SIZE_M 64
+#define BLOCK_SIZE_N 32
+#define BLOCK_SIZE_K 32
+#define THREAD_MAT_M 4
+#define THREAD_MAT_N 2
+#define THREAD_PER_ROW 2
+#define THREAD_PER_COL 4
+#define SG_MAT_SIZE 64
 
-// ── Q4_K indexed MoE forward ──
-// Computes: output[task_id, row] = dot(weights[expert_id][row], input[token_id])
-// where expert_id = indices[task_id]
+// Q4_K dequantization into half4x4 (16 half values from one block position)
+inline void dequantize_q4_K(device const block_q4_K * qb, short il, thread half4x4 & reg) {
+    const int ib32 = il / 2;
+    const int is  = 2 * ib32;
 
-kernel void indexed_moe_forward_q4k_f32(
-    device const  void  * all_weights  [[buffer(0)]],  // all expert weights in Q4_K blocks
-    device const  float * all_inputs   [[buffer(1)]],  // [batch_total, k] f32 input
-    device const  uint  * indices      [[buffer(2)]],  // [batch * topk] expert IDs
-    device        float * all_outputs  [[buffer(3)]],  // [batch * topk, n] output
-    constant      int   & n_out        [[buffer(4)]],  // output dim (rows per expert)
-    constant      int   & k_in         [[buffer(5)]],  // input dim (cols per expert)
-    constant      int   & topk_val     [[buffer(6)]],  // experts per token
-    constant      int   & input_dim1   [[buffer(7)]],  // 1=broadcast, topk=per-slot
-    uint3 tgpig [[threadgroup_position_in_grid]],
-    uint  tiisg [[thread_index_in_simdgroup]],
-    uint  sgitg [[simdgroup_index_in_threadgroup]]
-) {
-    const int first_row = tgpig.x * N_DST;
-    const int batch_id = tgpig.y;
-    const int topk_id = tgpig.z;
-    const int task_id = batch_id * topk_val + topk_id;
+    device const uint8_t * q = qb->qs + 16 * ib32;
+    device const uint8_t * sc = qb->scales;
 
-    if (first_row >= n_out) return;
-
-    // Expert selection
-    const uint expert_id = indices[task_id];
-    const int input_idx = (input_dim1 == 1) ? batch_id : task_id;
-
-    // Compute strides
-    const int nb = k_in / QK_K;  // blocks per row
-    const int expert_blocks = n_out * nb;  // total blocks per expert
-
-    // Pointers
-    device const block_q4_K * x = (device const block_q4_K *)all_weights + expert_id * expert_blocks + first_row * nb;
-    device const float      * y = all_inputs + input_idx * k_in;
-    device       float      * out = all_outputs + task_id * n_out;
-
-    // Adapted from candle's kernel_mul_mv_q4_K_f32_impl
-    const uint16_t kmask1 = 0x3f3f;
-    const uint16_t kmask2 = 0x0f0f;
-    const uint16_t kmask3 = 0xc0c0;
-
-    const int ix = tiisg/8;  // 0...3
-    const int it = tiisg%8;  // 0...7
-    const int iq = it/4;     // 0 or 1
-    const int ir = it%4;     // 0...3
-
-    const int ib_row = 0;  // always start at first_row's block offset (already applied to x)
-
-    float yl[16];
-    float yh[16];
-    float sumf[N_DST] = {0.f};
-
-    const int step = sizeof(block_q4_K) * nb / 2;
-
-    device const float * y4 = y + ix * QK_K + 64 * iq + 8 * ir;
-
-    uint16_t sc16[4];
-    thread const uint8_t * sc8 = (thread const uint8_t *)sc16;
-
-    // How many rows to actually compute (handle tail)
-    const int n_rows = min(N_DST, n_out - first_row);
-
-    for (int ib = ix; ib < nb; ib += 4) {
-
-        float4 sumy = {0.f, 0.f, 0.f, 0.f};
-        for (int i = 0; i < 8; ++i) {
-            yl[i+0] = y4[i+  0]; sumy[0] += yl[i+0];
-            yl[i+8] = y4[i+ 32]; sumy[1] += yl[i+8];
-            yh[i+0] = y4[i+128]; sumy[2] += yh[i+0];
-            yh[i+8] = y4[i+160]; sumy[3] += yh[i+8];
-        }
-
-        device const uint16_t * sc = (device const uint16_t *)x[ib].scales + iq;
-        device const uint16_t * q1 = (device const uint16_t *)x[ib].qs + 16 * iq + 4 * ir;
-        device const half     * dh = &x[ib].d;
-
-        for (int row = 0; row < n_rows; row++) {
-
-            sc16[0] = sc[0] & kmask1;
-            sc16[1] = sc[2] & kmask1;
-            sc16[2] = ((sc[4] >> 0) & kmask2) | ((sc[0] & kmask3) >> 2);
-            sc16[3] = ((sc[4] >> 4) & kmask2) | ((sc[2] & kmask3) >> 2);
-
-            device const uint16_t * q2 = q1 + 32;
-
-            float4 acc1 = {0.f, 0.f, 0.f, 0.f};
-            float4 acc2 = {0.f, 0.f, 0.f, 0.f};
-            for (int i = 0; i < 8; i += 2) {
-                acc1[0] += yl[i+0] * (q1[i/2] & 0x000F);
-                acc1[1] += yl[i+1] * (q1[i/2] & 0x0F00);
-                acc1[2] += yl[i+8] * (q1[i/2] & 0x00F0);
-                acc1[3] += yl[i+9] * (q1[i/2] & 0xF000);
-                acc2[0] += yh[i+0] * (q2[i/2] & 0x000F);
-                acc2[1] += yh[i+1] * (q2[i/2] & 0x0F00);
-                acc2[2] += yh[i+8] * (q2[i/2] & 0x00F0);
-                acc2[3] += yh[i+9] * (q2[i/2] & 0xF000);
-            }
-
-            float dall = dh[0];
-            float dmin = dh[1];
-            sumf[row] += dall * ((acc1[0] + 1.f/256.f * acc1[1]) * sc8[0] +
-                                 (acc1[2] + 1.f/256.f * acc1[3]) * sc8[1] * 1.f/16.f +
-                                 (acc2[0] + 1.f/256.f * acc2[1]) * sc8[4] +
-                                 (acc2[2] + 1.f/256.f * acc2[3]) * sc8[5] * 1.f/16.f) -
-                         dmin * (sumy[0] * sc8[2] + sumy[1] * sc8[3] + sumy[2] * sc8[6] + sumy[3] * sc8[7]);
-
-            q1 += step;
-            sc += step;
-            dh += step;
-        }
-
-        y4 += 4 * QK_K;
+    // Decode scales/mins
+    uint8_t d_sc, d_mn;
+    if (is < 4) {
+        d_sc = sc[is] & 63;
+        d_mn = (sc[is] >> 6) | ((sc[is + 8] & ((is < 2) ? 0x0F : 0xF0)) >> ((is < 2) ? 0 : 2));
+    } else {
+        d_sc = sc[is] & 63;
+        d_mn = (sc[is] >> 6) | ((sc[is + 4] & ((is < 6) ? 0x0F : 0xF0)) >> ((is < 6) ? 0 : 2));
     }
 
-    for (int row = 0; row < n_rows; ++row) {
-        float all_sum = simd_sum(sumf[row]);
-        if (tiisg == 0) {
-            out[first_row + row] = all_sum;
-        }
+    half d = qb->d;
+    half dmin = qb->dmin;
+    half scale = d * (half)d_sc;
+    half mn = dmin * (half)d_mn;
+
+    int shift = (il % 2) * 4;
+    for (int i = 0; i < 16; i++) {
+        int qi = q[i];
+        half v = scale * (half)((qi >> shift) & 0xF) - mn;
+        reg[i / 4][i % 4] = v;
     }
 }
 
-// F32 variant (for unquantized/shared expert weights)
-kernel void indexed_moe_forward_f32(
-    device const float * all_weights  [[buffer(0)]],
-    device const float * all_inputs   [[buffer(1)]],
-    device const uint  * indices      [[buffer(2)]],
-    device       float * all_outputs  [[buffer(3)]],
-    constant     int   & n_out        [[buffer(4)]],
-    constant     int   & k_in         [[buffer(5)]],
-    constant     int   & topk_val     [[buffer(6)]],
-    constant     int   & input_dim1   [[buffer(7)]],
+// Routed MoE matmul kernel for Q4_K weights.
+// route_counts[expert_id] = number of tokens for this expert
+// route_indices[offset + i] = (token_idx, expert_slot) packed as uint
+// Rust pre-computes offset = sum of counts for experts < expert_id
+kernel void moe_mm_q4k_routed(
+    device const  uchar  * all_weights     [[buffer(0)]],  // [n_experts, n_out, n_in] Q4_K
+    device const  float  * all_inputs      [[buffer(1)]],  // [batch_total, n_in] f32
+    device        float  * all_outputs     [[buffer(2)]],  // [batch * topk, n_out] f32
+    device const  uint   * route_counts    [[buffer(3)]],  // [n_experts] token count per expert
+    device const  uint   * route_tok_ids   [[buffer(4)]],  // [total_pairs] token indices (flat)
+    device const  uint   * route_pair_ids  [[buffer(5)]],  // [total_pairs] output pair indices
+    device const  uint   * route_offsets   [[buffer(6)]],  // [n_experts] cumulative offset into route arrays
+    constant      int    & n_out           [[buffer(7)]],  // output dimension
+    constant      int    & n_in            [[buffer(8)]],  // input dimension
+    threadgroup   uchar  * shared_memory   [[threadgroup(0)]],
     uint3 tgpig [[threadgroup_position_in_grid]],
-    uint  tiisg [[thread_index_in_simdgroup]]
+    uint  tiitg [[thread_index_in_threadgroup]],
+    uint  sgitg [[simdgroup_index_in_threadgroup]]
 ) {
-    const int row = tgpig.x;
-    const int batch_id = tgpig.y;
-    const int topk_id = tgpig.z;
-    const int task_id = batch_id * topk_val + topk_id;
+    const uint expert_id = tgpig.z;
+    const uint n_tokens_for_expert = route_counts[expert_id];
 
-    if (row >= n_out) return;
+    if (n_tokens_for_expert == 0) return;
 
-    const uint expert_id = indices[task_id];
-    const int input_idx = (input_dim1 == 1) ? batch_id : task_id;
+    const uint route_offset = route_offsets[expert_id];
+    const uint r0 = tgpig.y; // output tile row
+    const uint r1 = tgpig.x; // token tile col
 
-    device const float * w = all_weights + ((int)expert_id * n_out + row) * k_in;
-    device const float * x = all_inputs + input_idx * k_in;
+    if (r1 * BLOCK_SIZE_N >= n_tokens_for_expert) return;
 
-    float sumf = 0.0f;
-    for (int i = tiisg; i < k_in; i += 32) {
-        sumf += w[i] * x[i];
+    short n_rows = (n_out - (int)(r0 * BLOCK_SIZE_M) < BLOCK_SIZE_M)
+                 ? (n_out - (int)(r0 * BLOCK_SIZE_M)) : BLOCK_SIZE_M;
+    short n_cols = ((int)n_tokens_for_expert - (int)(r1 * BLOCK_SIZE_N) < BLOCK_SIZE_N)
+                 ? ((int)n_tokens_for_expert - (int)(r1 * BLOCK_SIZE_N)) : BLOCK_SIZE_N;
+
+    short thread_row = ((short)tiitg / THREAD_PER_ROW) < n_rows
+                     ? ((short)tiitg / THREAD_PER_ROW) : n_rows - 1;
+    short thread_col = ((short)tiitg / THREAD_PER_COL) < n_cols
+                     ? ((short)tiitg / THREAD_PER_COL) : n_cols - 1;
+
+    // Simdgroup matrix accumulators
+    simdgroup_half8x8  ma[4];
+    simdgroup_float8x8 mb[2];
+    simdgroup_float8x8 c_res[8];
+    for (int i = 0; i < 8; i++) {
+        c_res[i] = make_filled_simdgroup_matrix<float, 8>(0.f);
     }
 
-    sumf = simd_sum(sumf);
+    // Weight pointer for this expert
+    const int blocks_per_row = n_in / QK_K;
+    const int expert_stride = n_out * blocks_per_row * (int)sizeof(block_q4_K);
 
-    if (tiisg == 0) {
-        all_outputs[task_id * n_out + row] = sumf;
+    short il = (tiitg % THREAD_PER_ROW);
+    constexpr short nl = 2; // Q4_K: 2 half-blocks per full block
+    short offset1 = il / nl;
+
+    device const block_q4_K * x = (device const block_q4_K *)(
+        all_weights + expert_id * expert_stride
+        + (r0 * BLOCK_SIZE_M + thread_row) * blocks_per_row * sizeof(block_q4_K)
+    ) + offset1;
+
+    // Input pointer — read from routed token
+    uint local_col = r1 * BLOCK_SIZE_N + thread_col;
+    uint tok_idx = (local_col < n_tokens_for_expert)
+                 ? route_tok_ids[route_offset + local_col] : 0;
+
+    device const float * y = all_inputs
+        + tok_idx * n_in
+        + (BLOCK_SIZE_K / THREAD_PER_COL * (tiitg % THREAD_PER_COL));
+
+    threadgroup half  * sa = (threadgroup half  *)(shared_memory);
+    threadgroup float * sb = (threadgroup float *)(shared_memory + 4096);
+
+    for (int loop_k = 0; loop_k < n_in; loop_k += BLOCK_SIZE_K) {
+        // Dequantize weight block into threadgroup memory
+        half4x4 temp_a;
+        dequantize_q4_K(x, il, temp_a);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        for (int i = 0; i < 16; i++) {
+            *(sa + SG_MAT_SIZE * ((tiitg / THREAD_PER_ROW / 8)
+            +                     (tiitg % THREAD_PER_ROW) * 16 + (i / 8) * 8)
+            +                     (tiitg / THREAD_PER_ROW) % 8  + (i & 7) * 8) = temp_a[i/4][i%4];
+        }
+
+        // Load input into threadgroup memory
+        *(threadgroup float2x4 *)(sb + (tiitg % THREAD_PER_COL) * 8 * 32 + 8 * (tiitg / THREAD_PER_COL))
+            = *((device float2x4 *)y);
+
+        il = (il + 2 < nl) ? il + 2 : il % 2;
+        x  = (il < 2) ? x + (2 + nl - 1) / nl : x;
+        y += BLOCK_SIZE_K;
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // Simdgroup matrix multiply-accumulate
+        threadgroup half  * lsma = (sa + THREAD_MAT_M * SG_MAT_SIZE * (sgitg % 2));
+        threadgroup float * lsmb = (sb + THREAD_MAT_N * SG_MAT_SIZE * (sgitg / 2));
+
+        for (int ik = 0; ik < BLOCK_SIZE_K / 8; ik++) {
+            for (int i = 0; i < 4; i++) {
+                simdgroup_load(ma[i], lsma + SG_MAT_SIZE * i);
+            }
+            simdgroup_barrier(mem_flags::mem_none);
+            for (int i = 0; i < 2; i++) {
+                simdgroup_load(mb[i], lsmb + SG_MAT_SIZE * i);
+            }
+            simdgroup_barrier(mem_flags::mem_none);
+
+            for (int i = 0; i < 8; i++) {
+                simdgroup_multiply_accumulate(c_res[i], mb[i/4], ma[i%4], c_res[i]);
+            }
+
+            lsma += BLOCK_SIZE_M / SG_MAT_SIZE * SG_MAT_SIZE;
+            lsmb += BLOCK_SIZE_N / SG_MAT_SIZE * SG_MAT_SIZE;
+        }
+    }
+
+    // Write results — scatter to correct output positions
+    threadgroup float * temp_str = (threadgroup float *)shared_memory;
+
+    if ((sgitg / 2) == 0) {
+        for (int i = 0; i < 8; i++) {
+            simdgroup_store(c_res[i], temp_str + 8 * (sgitg % 2) + (i % 4) * BLOCK_SIZE_M + (i / 4) * 8, BLOCK_SIZE_M);
+        }
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if ((sgitg / 2) == 1) {
+        for (int i = 0; i < 8; i++) {
+            simdgroup_store(c_res[i], temp_str + 8 * (sgitg % 2) + (i % 4) * BLOCK_SIZE_M + (i / 4) * 8, BLOCK_SIZE_M);
+        }
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Write to output using scattered pair indices
+    for (int j = tiitg; j < n_cols * n_rows; j += 128) {
+        int col = j / n_rows;
+        int row = j % n_rows;
+
+        uint local_idx = r1 * BLOCK_SIZE_N + col;
+        if (local_idx >= n_tokens_for_expert) continue;
+
+        uint pair_idx = route_pair_ids[route_offset + local_idx];
+        int out_row = r0 * BLOCK_SIZE_M + row;
+        if (out_row >= n_out) continue;
+
+        all_outputs[pair_idx * n_out + out_row] = *(temp_str + col * BLOCK_SIZE_M + row);
     }
 }
