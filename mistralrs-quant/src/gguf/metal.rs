@@ -70,11 +70,34 @@ fn metal_buffer_and_offset(tensor: &Tensor) -> Result<(Buffer, usize)> {
     }
 }
 
-pub fn metal_indexed_moe_forward(qmatmul: &QMatMul, x: &Tensor, ids: &Tensor) -> Result<Tensor> {
+/// Metal indexed MoE forward with cached dequantization.
+/// First call dequantizes and caches; subsequent calls reuse the cache.
+pub fn metal_indexed_moe_forward(
+    qmatmul: &QMatMul,
+    x: &Tensor,
+    ids: &Tensor,
+    dequant_cache: &std::sync::Mutex<Option<Tensor>>,
+) -> Result<Tensor> {
     match qmatmul {
         QMatMul::QTensor(qtensor) => {
-            // Dequantize to f32 on device (Metal GPU)
-            let weights = qtensor.dequantize(x.device())?;
+            // Check cache first
+            let weights = {
+                let cache = dequant_cache.lock().map_err(|e| {
+                    candle_core::Error::Msg(format!("dequant cache lock: {e}"))
+                })?;
+                cache.clone()
+            };
+            let weights = match weights {
+                Some(w) => w,
+                None => {
+                    let w = qtensor.dequantize(x.device())?;
+                    let mut cache = dequant_cache.lock().map_err(|e| {
+                        candle_core::Error::Msg(format!("dequant cache lock: {e}"))
+                    })?;
+                    *cache = Some(w.clone());
+                    w
+                }
+            };
             dispatch_moe_kernel(&weights, x, ids)
         }
         QMatMul::Tensor(t) | QMatMul::TensorF16(t) => {
