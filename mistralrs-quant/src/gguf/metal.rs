@@ -194,9 +194,11 @@ fn dispatch_quantized_moe(qtensor: &Arc<QTensor>, x: &Tensor, ids: &Tensor) -> R
     encoder.use_resource(&id_buf, MTLResourceUsage::Read);
     encoder.use_resource(&out_buf, MTLResourceUsage::Write);
 
-    // mm_id needs threadgroup memory for tiling (8192 bytes).
-    // The kernel allocates rowids internally (threadgroup short rowids[3072]).
-    encoder.set_threadgroup_memory_length(0, 8192);
+    // mm_id needs threadgroup memory: 8192 for tiling + rowids after that.
+    // rowids: ushort2 per matched token (4 bytes each), max nei0*nei1 entries.
+    // Cap at 32KB (Metal limit) — kernel handles overflow by truncating.
+    let rowids_bytes = (batch * topk * 4).min(32768 - 8192);
+    encoder.set_threadgroup_memory_length(0, 8192 + rowids_bytes);
 
     encoder.dispatch_thread_groups(thread_groups, threads_per_group);
 
