@@ -1,8 +1,9 @@
-//! Metal implementation of indexed MoE forward for GGUF/ISQ quantized weights.
+//! Metal MoE forward — dual-path dispatch:
+//! 1. Custom tiled kernel (moe_mm_q4k_routed) for prefill (many tokens)
+//! 2. Candle's kernel_mul_mv_id for decode (single token)
 //!
-//! Dispatches candle's `kernel_mul_mv_id_q4_K_f32` — the expert-indexed
-//! quantized matmul that operates directly on Q4_K blocks with simdgroup ops.
-//! No dequantization, no CPU loops, full GPU speed.
+//! The tiled kernel uses device-buffer routing (no threadgroup limit)
+//! and simdgroup_multiply_accumulate for full GPU utilization.
 
 use candle_core::{
     backend::BackendStorage,
@@ -12,10 +13,53 @@ use candle_core::{
 use std::sync::Arc;
 
 use candle_metal_kernels::{
-    metal::{Buffer, ComputeCommandEncoder, Device as MetalRawDevice},
+    metal::{Buffer, ComputeCommandEncoder, ComputePipeline, Device as MetalRawDevice, Library},
     set_params, Kernels, Source,
 };
-use objc2_metal::{MTLResourceUsage, MTLSize};
+use objc2_metal::{MTLCompileOptions, MTLMathMode, MTLResourceUsage, MTLSize};
+use std::collections::HashMap;
+use std::sync::{OnceLock, RwLock};
+
+// ── Custom kernel loading ──
+
+static MOE_LIBRARY: OnceLock<Library> = OnceLock::new();
+static MOE_PIPELINES: OnceLock<RwLock<HashMap<String, ComputePipeline>>> = OnceLock::new();
+
+const MOE_METAL_SOURCE: &str = include_str!("../metal_kernels/indexed_moe.metal");
+
+fn load_moe_library(device: &MetalRawDevice) -> Result<Library> {
+    if let Some(lib) = MOE_LIBRARY.get() {
+        return Ok(lib.clone());
+    }
+    let opts = MTLCompileOptions::new();
+    opts.setMathMode(MTLMathMode::Fast);
+    let lib = device
+        .new_library_with_source(MOE_METAL_SOURCE, Some(&opts))
+        .map_err(|e| candle_core::Error::Msg(format!("MoE Metal compile: {e}")))?;
+    Ok(MOE_LIBRARY.get_or_init(|| lib).clone())
+}
+
+fn load_moe_pipeline(device: &MetalRawDevice, name: &str) -> Result<ComputePipeline> {
+    let lock = MOE_PIPELINES.get_or_init(|| RwLock::new(HashMap::new()));
+    {
+        let cache = lock.read().map_err(|e| candle_core::Error::Msg(format!("{e}")))?;
+        if let Some(p) = cache.get(name) {
+            return Ok(p.clone());
+        }
+    }
+    let lib = load_moe_library(device)?;
+    let func = lib.get_function(name, None).map_err(|e| {
+        candle_core::Error::Msg(format!("MoE function '{name}': {e}"))
+    })?;
+    let pipeline = device.new_compute_pipeline_state_with_function(&func).map_err(|e| {
+        candle_core::Error::Msg(format!("MoE pipeline '{name}': {e}"))
+    })?;
+    let mut cache = lock.write().map_err(|e| candle_core::Error::Msg(format!("{e}")))?;
+    cache.insert(name.to_string(), pipeline.clone());
+    Ok(pipeline)
+}
+
+// ── Helpers ──
 
 fn metal_buffer_and_offset(tensor: &Tensor) -> Result<(Buffer, usize)> {
     let (storage, layout) = tensor.storage_and_layout();
@@ -24,18 +68,19 @@ fn metal_buffer_and_offset(tensor: &Tensor) -> Result<(Buffer, usize)> {
             let offset = layout.start_offset() * m.dtype().size_in_bytes();
             Ok((m.buffer().clone(), offset))
         }
-        _ => candle_core::bail!("Expected Metal tensor for MoE kernel"),
+        _ => candle_core::bail!("Expected Metal tensor"),
     }
 }
 
-/// Get the raw Metal buffer from a QTensor without dequantizing.
 fn qtensor_metal_buffer(qtensor: &QTensor) -> Result<(Buffer, GgmlDType)> {
-    let metal_storage = qtensor.metal_storage()?;
-    Ok((metal_storage.buffer().clone(), qtensor.dtype()))
+    let ms = qtensor.metal_storage()?;
+    Ok((ms.buffer().clone(), qtensor.dtype()))
 }
 
-/// Metal indexed MoE forward — dispatches candle's fused kernel.
-/// Operates directly on quantized blocks, no dequantization needed.
+fn divide(m: usize, n: usize) -> usize { (m + n - 1) / n }
+
+// ── Public API ──
+
 pub fn metal_indexed_moe_forward(
     qmatmul: &QMatMul,
     x: &Tensor,
@@ -44,92 +89,183 @@ pub fn metal_indexed_moe_forward(
 ) -> Result<Tensor> {
     match qmatmul {
         QMatMul::QTensor(qtensor) => dispatch_quantized_moe(qtensor, x, ids),
-        QMatMul::Tensor(t) | QMatMul::TensorF16(t) => {
-            // Unquantized weights — use regular per-expert matmul
-            dispatch_unquantized_moe(t, x, ids)
-        }
+        QMatMul::Tensor(t) | QMatMul::TensorF16(t) => dispatch_unquantized_moe(t, x, ids),
     }
 }
 
-/// Dispatch candle's kernel_mul_mv_id for quantized MoE weights.
-/// This calls the fused expert-indexed Q4_K kernel directly.
+// ── Quantized MoE dispatch ──
+
 fn dispatch_quantized_moe(qtensor: &Arc<QTensor>, x: &Tensor, ids: &Tensor) -> Result<Tensor> {
     let Device::Metal(dev) = x.device() else {
-        candle_core::bail!("dispatch_quantized_moe: expected Metal device");
+        candle_core::bail!("expected Metal device");
     };
 
-    // Get weight buffer directly (no dequantization!)
     let (w_buf, ggml_dtype) = qtensor_metal_buffer(qtensor)?;
-
-    // Weight shape: [n_experts, n_out, n_in] stored as contiguous Q4_K blocks
-    // QTensor shape gives us the logical dimensions
-    let w_shape = qtensor.shape();
-    let (n_experts, n_out, n_in) = match w_shape.dims() {
+    let (n_experts, n_out, n_in) = match qtensor.shape().dims() {
         &[e, o, i] => (e, o, i),
-        dims => candle_core::bail!("Expected 3D weight tensor, got {dims:?}"),
+        d => candle_core::bail!("Expected 3D weights, got {d:?}"),
     };
 
-    // Normalize input shape
     let (batch, topk, input_dim1, x_flat) = match x.dims() {
-        &[b, s, 1, 1, h] => {
-            let (_, _, k) = ids.dims3()?;
-            (b * s, k, 1usize, x.reshape((b * s, h))?)
-        }
-        &[b, s, k, h] if k > 1 => {
-            (b * s, k, k, x.reshape((b * s * k, h))?)
-        }
-        &[n, 1, h] => {
-            let (_, k) = ids.dims2()?;
-            (n, k, 1, x.reshape((n, h))?)
-        }
-        dims => candle_core::bail!("dispatch_quantized_moe: unsupported input {dims:?}"),
+        &[b, s, 1, 1, h] => { let (_, _, k) = ids.dims3()?; (b*s, k, 1usize, x.reshape((b*s, h))?) }
+        &[b, s, k, h] if k > 1 => (b*s, k, k, x.reshape((b*s*k, h))?),
+        &[n, 1, h] => { let (_, k) = ids.dims2()?; (n, k, 1, x.reshape((n, h))?) }
+        d => candle_core::bail!("unsupported input {d:?}"),
     };
 
-    // Expert IDs as i32 (candle kernel reads int32_t from raw bytes)
-    let flat_ids = ids.reshape((batch, topk))?.to_dtype(DType::U32)?;
+    let total_pairs = batch * topk;
+
+    // For single-token decode, use mv_id (fast for matvec)
+    // For prefill (many tokens), use custom tiled kernel
+    let use_tiled = batch > 1 && ggml_dtype == GgmlDType::Q4K;
+
+    if use_tiled {
+        dispatch_tiled_moe(dev, &w_buf, n_experts, n_out, n_in, &x_flat, ids, batch, topk, input_dim1, x.dims())
+    } else {
+        dispatch_mv_id_moe(dev, &w_buf, ggml_dtype, n_experts, n_out, n_in, &x_flat, ids, batch, topk, input_dim1, x.dims())
+    }
+}
+
+/// Custom tiled kernel with device-buffer routing
+fn dispatch_tiled_moe(
+    dev: &candle_core::MetalDevice,
+    w_buf: &Buffer,
+    n_experts: usize, n_out: usize, n_in: usize,
+    x_flat: &Tensor, ids: &Tensor,
+    batch: usize, topk: usize, input_dim1: usize,
+    orig_dims: &[usize],
+) -> Result<Tensor> {
+    let total_pairs = batch * topk;
+    let flat_ids = ids.reshape((total_pairs,))?.to_dtype(DType::U32)?;
+    let idx_vec: Vec<u32> = flat_ids.to_vec1()?;
+
+    // Build routing table
+    let mut expert_pairs: Vec<Vec<(u32, u32)>> = vec![Vec::new(); n_experts]; // (tok_idx, pair_idx)
+    for (pair_idx, &eid) in idx_vec.iter().enumerate() {
+        let tok_idx = if input_dim1 == 1 { pair_idx / topk } else { pair_idx };
+        expert_pairs[eid as usize].push((tok_idx as u32, pair_idx as u32));
+    }
+
+    // Build flat routing arrays
+    let mut route_counts = vec![0u32; n_experts];
+    let mut route_offsets = vec![0u32; n_experts];
+    let mut route_tok_ids = Vec::with_capacity(total_pairs);
+    let mut route_pair_ids = Vec::with_capacity(total_pairs);
+    let mut max_tokens_per_expert = 0usize;
+
+    let mut offset = 0u32;
+    for (eid, pairs) in expert_pairs.iter().enumerate() {
+        route_counts[eid] = pairs.len() as u32;
+        route_offsets[eid] = offset;
+        max_tokens_per_expert = max_tokens_per_expert.max(pairs.len());
+        for &(tok, pair) in pairs {
+            route_tok_ids.push(tok);
+            route_pair_ids.push(pair);
+        }
+        offset += pairs.len() as u32;
+    }
+
+    // Create Metal tensors for routing
+    let device = x_flat.device();
+    let counts_t = Tensor::new(route_counts, device)?;
+    let offsets_t = Tensor::new(route_offsets, device)?;
+    let tok_ids_t = Tensor::new(route_tok_ids, device)?;
+    let pair_ids_t = Tensor::new(route_pair_ids, device)?;
 
     let x_flat = x_flat.contiguous()?.to_dtype(DType::F32)?;
-    let flat_ids = flat_ids.contiguous()?;
+    let output = Tensor::zeros((total_pairs, n_out), DType::F32, device)?;
 
-    // Output: [batch * topk, n_out]
-    let output = Tensor::zeros((batch * topk, n_out), DType::F32, x.device())?;
+    let (x_buf, x_off) = metal_buffer_and_offset(&x_flat)?;
+    let (out_buf, out_off) = metal_buffer_and_offset(&output)?;
+    let (cnt_buf, cnt_off) = metal_buffer_and_offset(&counts_t)?;
+    let (tok_buf, tok_off) = metal_buffer_and_offset(&tok_ids_t)?;
+    let (pair_buf, pair_off) = metal_buffer_and_offset(&pair_ids_t)?;
+    let (off_buf, off_off) = metal_buffer_and_offset(&offsets_t)?;
+
+    let n_out_i32 = n_out as i32;
+    let n_in_i32 = n_in as i32;
+
+    let pipeline = load_moe_pipeline(dev.device(), "moe_mm_q4k_routed")?;
+
+    let encoder = dev.command_encoder()?;
+    let encoder: &ComputeCommandEncoder = encoder.as_ref();
+    encoder.set_compute_pipeline_state(&pipeline);
+
+    encoder.set_buffer(0, Some(w_buf), 0);
+    encoder.set_buffer(1, Some(&x_buf), x_off);
+    encoder.set_buffer(2, Some(&out_buf), out_off);
+    encoder.set_buffer(3, Some(&cnt_buf), cnt_off);
+    encoder.set_buffer(4, Some(&tok_buf), tok_off);
+    encoder.set_buffer(5, Some(&pair_buf), pair_off);
+    encoder.set_buffer(6, Some(&off_buf), off_off);
+    encoder.set_bytes(7, &n_out_i32);
+    encoder.set_bytes(8, &n_in_i32);
+
+    // Grid: (ceil(max_tokens/32), ceil(n_out/64), n_experts)
+    let grid = MTLSize {
+        width: divide(max_tokens_per_expert, 32),
+        height: divide(n_out, 64),
+        depth: n_experts,
+    };
+    let threads = MTLSize { width: 128, height: 1, depth: 1 };
+
+    encoder.use_resource(w_buf, MTLResourceUsage::Read);
+    encoder.use_resource(&x_buf, MTLResourceUsage::Read);
+    encoder.use_resource(&out_buf, MTLResourceUsage::Write);
+    encoder.use_resource(&cnt_buf, MTLResourceUsage::Read);
+    encoder.use_resource(&tok_buf, MTLResourceUsage::Read);
+    encoder.use_resource(&pair_buf, MTLResourceUsage::Read);
+    encoder.use_resource(&off_buf, MTLResourceUsage::Read);
+
+    encoder.set_threadgroup_memory_length(0, 8192);
+    encoder.dispatch_thread_groups(grid, threads);
+
+    reshape_output(&output, orig_dims, ids)
+}
+
+/// Candle's kernel_mul_mv_id — good for single-token decode
+fn dispatch_mv_id_moe(
+    dev: &candle_core::MetalDevice,
+    w_buf: &Buffer,
+    ggml_dtype: GgmlDType,
+    _n_experts: usize, n_out: usize, n_in: usize,
+    x_flat: &Tensor, ids: &Tensor,
+    batch: usize, topk: usize, input_dim1: usize,
+    orig_dims: &[usize],
+) -> Result<Tensor> {
+    let flat_ids = ids.reshape((batch, topk))?.to_dtype(DType::U32)?;
+    let x_flat = x_flat.contiguous()?.to_dtype(DType::F32)?;
+    let flat_ids = flat_ids.contiguous()?;
+    let output = Tensor::zeros((batch * topk, n_out), DType::F32, x_flat.device())?;
 
     let (x_buf, x_off) = metal_buffer_and_offset(&x_flat)?;
     let (id_buf, id_off) = metal_buffer_and_offset(&flat_ids)?;
     let (out_buf, out_off) = metal_buffer_and_offset(&output)?;
 
-    // Kernel parameters matching kernel_mul_mv_id signature
-    let nei0 = topk as i64;        // experts per token
-    let nei1 = batch as i64;       // number of tokens
-    let nbi1 = (topk * 4) as u64;  // stride of ids in bytes (u32 = 4 bytes)
-
-    let ne00 = n_in as i64;        // input dim (K)
-    let ne01 = n_out as i64;       // output dim (N)
-    let ne02 = 1i64;               // batch dim in weights
-
-    // Byte strides for weights
     let block_size = ggml_dtype.block_size();
     let type_size = ggml_dtype.type_size();
-    let nb00 = type_size as u64;
     let blocks_per_row = n_in / block_size;
-    let nb01 = (blocks_per_row * type_size) as u64;  // bytes per weight row
-    let nb02 = (n_out as u64) * nb01;                 // bytes per expert
+    let nb01 = (blocks_per_row * type_size) as u64;
+    let nb02 = (n_out as u64) * nb01;
 
+    let nei0 = topk as i64;
+    let nei1 = batch as i64;
+    let nbi1 = (topk * 4) as u64;
+    let ne00 = n_in as i64;
+    let ne01 = n_out as i64;
+    let ne02 = 1i64;
+    let nb00 = type_size as u64;
     let ne10 = n_in as i64;
-    // For 5D/3D input: ne11=1 (broadcast same token to all expert slots)
-    // For 4D input: ne11=topk (each expert slot has its own input)
     let ne11 = input_dim1 as i64;
     let ne12 = 1i64;
     let ne13 = 1i64;
-    let nb10 = 4u64;               // f32 = 4 bytes
-    let nb11 = (n_in * 4) as u64;  // bytes per input row
-    let nb12 = (input_dim1 as u64) * nb11;  // bytes per token group
-
+    let nb10 = 4u64;
+    let nb11 = (n_in * 4) as u64;
+    let nb12 = (input_dim1 as u64) * nb11;
     let ne0 = n_out as i64;
-    let ne1 = topk as i64;  // output stride: dst[expert_slot * ne0 + token * ne1 * ne0]
+    let ne1 = topk as i64;
     let nb1 = (n_out * 4) as u64;
 
-    // Thread group config for Q4_K
     let (nth0, nth1, align) = match ggml_dtype {
         GgmlDType::Q4K => (4usize, 8usize, 4usize),
         GgmlDType::Q2K => (2, 32, 4),
@@ -138,7 +274,6 @@ fn dispatch_quantized_moe(qtensor: &Arc<QTensor>, x: &Tensor, ids: &Tensor) -> R
         GgmlDType::Q8_0 => (8, 8, 8),
         _ => (32, 1, 8),
     };
-
     let kernel_name = match ggml_dtype {
         GgmlDType::Q4K => "kernel_mul_mv_id_q4_K_f32",
         GgmlDType::Q2K => "kernel_mul_mv_id_q2_K_f32",
@@ -146,147 +281,69 @@ fn dispatch_quantized_moe(qtensor: &Arc<QTensor>, x: &Tensor, ids: &Tensor) -> R
         GgmlDType::Q5K => "kernel_mul_mv_id_q5_K_f32",
         GgmlDType::Q6K => "kernel_mul_mv_id_q6_K_f32",
         GgmlDType::Q8_0 => "kernel_mul_mv_id_q8_0_f32",
-        dt => candle_core::bail!("Unsupported GGML dtype for Metal MoE: {dt:?}"),
+        dt => candle_core::bail!("Unsupported dtype: {dt:?}"),
     };
 
-    fn divide(m: usize, n: usize) -> usize {
-        (m + n - 1) / n
-    }
+    let tg = MTLSize { width: divide(n_out, align), height: 1, depth: batch * topk };
+    let tpg = MTLSize { width: nth0, height: nth1, depth: 1 };
 
-    let thread_groups = MTLSize {
-        width: divide(n_out, align),
-        height: 1, // one token per dispatch in _id mode
-        depth: (topk * batch) as usize,
-    };
-    let threads_per_group = MTLSize {
-        width: nth0,
-        height: nth1,
-        depth: 1,
-    };
-
-    let pipeline = dev
-        .kernels()
+    let pipeline = dev.kernels()
         .load_pipeline(dev.device(), Source::Quantized, kernel_name)
-        .map_err(|e| candle_core::Error::Msg(format!("MoE kernel load failed: {e}")))?;
+        .map_err(|e| candle_core::Error::Msg(format!("mv_id load: {e}")))?;
 
     let encoder = dev.command_encoder()?;
     let encoder: &ComputeCommandEncoder = encoder.as_ref();
     encoder.set_compute_pipeline_state(&pipeline);
 
-    // Buffer layout for kernel_mul_mv_id:
-    // 0: src0s (all expert weights)
-    // 1: src1 (input tokens)
-    // 2: dst (output)
-    // 3: ids (expert indices)
-    // 4+: scalar args
-    set_params!(
-        encoder,
-        (
-            (&w_buf, 0usize),     // src0s
-            (&x_buf, x_off),      // src1
-            (&out_buf, out_off),   // dst
-            (&id_buf, id_off),     // ids
-            nei0,
-            nei1,
-            nbi1,
-            ne00,
-            ne01,
-            ne02,
-            nb00,
-            nb01,
-            nb02,
-            ne10,
-            ne11,
-            ne12,
-            ne13,
-            nb10,
-            nb11,
-            nb12,
-            ne0,
-            ne1,
-            nb1
-        )
-    );
-
-    encoder.use_resource(&w_buf, MTLResourceUsage::Read);
+    set_params!(encoder, (
+        (w_buf, 0usize), (&x_buf, x_off), (&out_buf, out_off), (&id_buf, id_off),
+        nei0, nei1, nbi1,
+        ne00, ne01, ne02, nb00, nb01, nb02,
+        ne10, ne11, ne12, ne13, nb10, nb11, nb12,
+        ne0, ne1, nb1
+    ));
+    encoder.use_resource(w_buf, MTLResourceUsage::Read);
     encoder.use_resource(&x_buf, MTLResourceUsage::Read);
     encoder.use_resource(&id_buf, MTLResourceUsage::Read);
     encoder.use_resource(&out_buf, MTLResourceUsage::Write);
+    encoder.dispatch_thread_groups(tg, tpg);
 
-    encoder.dispatch_thread_groups(thread_groups, threads_per_group);
+    reshape_output(&output, orig_dims, ids)
+}
 
-    // Reshape output
-    match x.dims() {
-        &[b, s, 1, 1, _] => {
-            let (_, _, k) = ids.dims3()?;
-            output.reshape((b, s, k, n_out))
-        }
-        &[b, s, k, _] if k > 1 => output.reshape((b, s, k, n_out)),
-        &[n, 1, _] => {
-            let (_, k) = ids.dims2()?;
-            output.reshape((n, k, n_out))
-        }
-        _ => Ok(output),
+fn reshape_output(output: &Tensor, orig_dims: &[usize], ids: &Tensor) -> Result<Tensor> {
+    match orig_dims {
+        &[b, s, 1, 1, _] => { let (_, _, k) = ids.dims3()?; output.reshape((b, s, k, output.dim(1)?)) }
+        &[b, s, k, _] if k > 1 => output.reshape((b, s, k, output.dim(1)?)),
+        &[n, 1, _] => { let (_, k) = ids.dims2()?; output.reshape((n, k, output.dim(1)?)) }
+        _ => Ok(output.clone()),
     }
 }
 
-/// Fallback for unquantized weights (shared expert, etc.)
 fn dispatch_unquantized_moe(weights: &Tensor, x: &Tensor, ids: &Tensor) -> Result<Tensor> {
-    let (num_experts, out_features, in_features) = weights.dims3()?;
-
+    let (ne, of, _) = weights.dims3()?;
     let (batch, topk, x_flat) = match x.dims() {
-        &[b, s, 1, 1, h] => {
-            let (_, _, k) = ids.dims3()?;
-            (b * s, k, x.reshape((b * s, h))?)
-        }
-        &[b, s, k, h] if k > 1 => (b * s, k, x.reshape((b * s * k, h))?),
-        &[n, 1, h] => {
-            let (_, k) = ids.dims2()?;
-            (n, k, x.reshape((n, h))?)
-        }
-        dims => candle_core::bail!("dispatch_unquantized_moe: unsupported {dims:?}"),
+        &[b, s, 1, 1, h] => { let (_, _, k) = ids.dims3()?; (b*s, k, x.reshape((b*s, h))?) }
+        &[b, s, k, h] if k > 1 => (b*s, k, x.reshape((b*s*k, h))?),
+        &[n, 1, h] => { let (_, k) = ids.dims2()?; (n, k, x.reshape((n, h))?) }
+        d => candle_core::bail!("unsupported {d:?}"),
     };
-
-    let flat_ids = ids.reshape((batch * topk,))?;
-    let idx_vec: Vec<u32> = flat_ids.to_vec1()?;
-
-    let mut expert_tokens: Vec<Vec<usize>> = vec![Vec::new(); num_experts];
-    for (pair_idx, &eid) in idx_vec.iter().enumerate() {
-        expert_tokens[eid as usize].push(pair_idx);
+    let fi = ids.reshape((batch*topk,))?;
+    let iv: Vec<u32> = fi.to_vec1()?;
+    let mut et: Vec<Vec<usize>> = vec![Vec::new(); ne];
+    for (pi, &eid) in iv.iter().enumerate() { et[eid as usize].push(pi); }
+    let dev = x.device();
+    let dt = x.dtype();
+    let mut out = Tensor::zeros((batch*topk, of), dt, dev)?;
+    for (eid, pairs) in et.iter().enumerate() {
+        if pairs.is_empty() { continue; }
+        let ei = Tensor::new(&[eid as u32], dev)?;
+        let ew = weights.index_select(&ei, 0)?.squeeze(0)?;
+        let ti: Vec<u32> = pairs.iter().map(|&p| (p/topk) as u32).collect();
+        let tok = x_flat.index_select(&Tensor::new(ti, dev)?, 0)?;
+        let r = tok.matmul(&ew.t()?)?;
+        let pi = Tensor::new(pairs.iter().map(|&i| i as u32).collect::<Vec<_>>(), dev)?;
+        out = out.index_add(&pi, &r, 0)?;
     }
-
-    let device = x.device();
-    let dtype = x.dtype();
-    let mut output = Tensor::zeros((batch * topk, out_features), dtype, device)?;
-
-    for (expert_id, pairs) in expert_tokens.iter().enumerate() {
-        if pairs.is_empty() {
-            continue;
-        }
-        let eid = Tensor::new(&[expert_id as u32], device)?;
-        let expert_w = weights.index_select(&eid, 0)?.squeeze(0)?;
-        let tok_ids: Vec<u32> = pairs
-            .iter()
-            .map(|&p| (p / topk) as u32)
-            .collect();
-        let tok_idx = Tensor::new(tok_ids, device)?;
-        let tokens = x_flat.index_select(&tok_idx, 0)?;
-        let result = tokens.matmul(&expert_w.t()?)?;
-        let pair_idx =
-            Tensor::new(pairs.iter().map(|&i| i as u32).collect::<Vec<_>>(), device)?;
-        output = output.index_add(&pair_idx, &result, 0)?;
-    }
-
-    match x.dims() {
-        &[b, s, 1, 1, _] => {
-            let (_, _, k) = ids.dims3()?;
-            output.reshape((b, s, k, out_features))
-        }
-        &[b, s, k, _] if k > 1 => output.reshape((b, s, k, out_features)),
-        &[n, 1, _] => {
-            let (_, k) = ids.dims2()?;
-            output.reshape((n, k, out_features))
-        }
-        _ => Ok(output),
-    }
+    reshape_output(&out, x.dims(), ids)
 }
