@@ -85,8 +85,8 @@ fn dispatch_quantized_moe(qtensor: &Arc<QTensor>, x: &Tensor, ids: &Tensor) -> R
         dims => candle_core::bail!("dispatch_quantized_moe: unsupported input {dims:?}"),
     };
 
-    // Expert IDs as i32 (candle kernel expects int32)
-    let flat_ids = ids.reshape((batch, topk))?.to_dtype(DType::I64)?;
+    // Expert IDs as i32 (candle kernel reads int32_t from raw bytes)
+    let flat_ids = ids.reshape((batch, topk))?.to_dtype(DType::U32)?;
 
     let x_flat = x_flat.contiguous()?.to_dtype(DType::F32)?;
     let flat_ids = flat_ids.contiguous()?;
@@ -101,7 +101,7 @@ fn dispatch_quantized_moe(qtensor: &Arc<QTensor>, x: &Tensor, ids: &Tensor) -> R
     // Kernel parameters matching kernel_mul_mv_id signature
     let nei0 = topk as i64;        // experts per token
     let nei1 = batch as i64;       // number of tokens
-    let nbi1 = (topk * 8) as u64;  // stride of ids in bytes (i64 = 8 bytes)
+    let nbi1 = (topk * 4) as u64;  // stride of ids in bytes (u32 = 4 bytes)
 
     let ne00 = n_in as i64;        // input dim (K)
     let ne01 = n_out as i64;       // output dim (N)
