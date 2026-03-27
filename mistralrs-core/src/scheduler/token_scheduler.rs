@@ -496,6 +496,10 @@ impl Scheduler for TokenScheduler {
         Some(self.schedule_iteration())
     }
 
+    fn get_sequence(&self, id: super::SequenceId) -> Option<&Sequence> {
+        self.get_sequence(id)
+    }
+
     fn get_sequence_mut(&mut self, id: super::SequenceId) -> Option<&mut Sequence> {
         self.get_sequence_mut(id)
     }

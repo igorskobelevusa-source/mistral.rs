@@ -96,6 +96,11 @@ pub trait Scheduler: Send + Sync {
         None
     }
 
+    /// Get reference to a sequence by ID.
+    fn get_sequence(&self, _id: SequenceId) -> Option<&Sequence> {
+        None
+    }
+
     /// Get mutable reference to a sequence by ID.
     fn get_sequence_mut(&mut self, _id: SequenceId) -> Option<&mut Sequence> {
         None

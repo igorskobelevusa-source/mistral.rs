@@ -371,12 +371,17 @@ impl Engine {
                     }
                 };
 
-                // Handle prefill chunks
+                // Handle prefill sequences
+                // Phase 1: Full prefill (not chunked). Interleaving is at sequence level.
+                // Phase 2 TODO: True chunked prefill with token ranges.
                 for chunk in &batch.prefill {
-                    if let Some(seq) = scheduler.get_sequence_mut(chunk.seq_id) {
-                        let chunk_tokens = chunk.end_pos - chunk.start_pos;
+                    let prompt_len = scheduler
+                        .get_sequence(chunk.seq_id)
+                        .map(|s| s.prompt_tokens())
+                        .unwrap_or(0);
 
-                        // Run prefill for this chunk
+                    if let Some(seq) = scheduler.get_sequence_mut(chunk.seq_id) {
+                        // Run full prefill for this sequence
                         let mut seqs = vec![seq];
                         let res = {
                             let mut pipeline = get_mut_arcmutex!(self.pipeline);
@@ -406,14 +411,14 @@ impl Engine {
                         };
 
                         if let Err(e) = res {
-                            tracing::error!("Prefill chunk error: {e}");
+                            tracing::error!("Prefill error: {e}");
                         }
 
-                        self.logger.add_tokens_processed(chunk_tokens);
+                        self.logger.add_tokens_processed(prompt_len);
                     }
 
-                    // Record prefill progress (after dropping seq borrow)
-                    scheduler.record_prefill_progress(chunk.seq_id, chunk.end_pos - chunk.start_pos);
+                    // Mark full prefill complete (Phase 1: no chunking)
+                    scheduler.record_prefill_progress(chunk.seq_id, prompt_len);
                 }
 
                 // Handle decode batch
