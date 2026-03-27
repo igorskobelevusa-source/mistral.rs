@@ -1,23 +1,20 @@
-// Custom indexed MoE forward kernel for Metal with device-buffer routing.
-// Based on candle's kernel_mul_mm_id but reads routing table from device memory
-// instead of threadgroup memory — eliminates the 32KB threadgroup limit.
+// Routed MoE tiled matmul kernel for Metal.
+// Based on candle's kernel_mul_mm_id but reads routing table from
+// DEVICE MEMORY instead of threadgroup memory — no 32KB limit.
 //
-// Two-phase:
-// 1. Rust builds per-expert routing table as device buffer
-// 2. This kernel does tiled simdgroup matmul per expert
-//
-// Grid: (ceil(max_tokens_per_expert/32), ceil(n_out/64), n_experts)
-// Threads: 128 (4 simdgroups)
+// Rust builds the routing table (rowids) as a device buffer.
+// This kernel is identical to candle's kernel_mul_mm_id_impl
+// except rowids is `device const` not `threadgroup`.
 
 #include <metal_stdlib>
 #include <metal_simdgroup>
 #include <metal_simdgroup_matrix>
 using namespace metal;
 
+// ── Block types ──
 #define QK_K 256
 #define K_SCALE_SIZE 12
 
-// Block types
 typedef struct {
     half d;
     half dmin;
@@ -25,7 +22,7 @@ typedef struct {
     uint8_t qs[QK_K/2];
 } block_q4_K;
 
-// Tiling constants (same as candle/llama.cpp)
+// ── Tiling constants (same as candle/llama.cpp) ──
 #define BLOCK_SIZE_M 64
 #define BLOCK_SIZE_N 32
 #define BLOCK_SIZE_K 32
@@ -34,113 +31,109 @@ typedef struct {
 #define THREAD_PER_ROW 2
 #define THREAD_PER_COL 4
 #define SG_MAT_SIZE 64
+#define SG_MAT_ROW 8
+#define QK_NL 16
 
-// Q4_K dequantization into half4x4 (16 half values from one block position)
-inline void dequantize_q4_K(device const block_q4_K * qb, short il, thread half4x4 & reg) {
-    const int ib32 = il / 2;
-    const int is  = 2 * ib32;
+// ── Scale/min extraction (from candle) ──
+static inline uchar2 get_scale_min_k4_just2(int j, int k, device const uchar * q) {
+    return j < 4 ? uchar2{uchar(q[j+0+k] & 63), uchar(q[j+4+k] & 63)}
+                 : uchar2{uchar((q[j+4+k] & 0xF) | ((q[j-4+k] & 0xc0) >> 2)),
+                           uchar((q[j+4+k] >> 4) | ((q[j-0+k] & 0xc0) >> 2))};
+}
 
-    device const uint8_t * q = qb->qs + 16 * ib32;
-    device const uint8_t * sc = qb->scales;
+// ── Q4_K dequantization (from candle, exact copy) ──
+void dequantize_q4_K(device const block_q4_K *xb, short il, thread half4x4 & reg) {
+    device const uchar * q = xb->qs;
 
-    // Decode scales/mins
-    uint8_t d_sc, d_mn;
-    if (is < 4) {
-        d_sc = sc[is] & 63;
-        d_mn = (sc[is] >> 6) | ((sc[is + 8] & ((is < 2) ? 0x0F : 0xF0)) >> ((is < 2) ? 0 : 2));
-    } else {
-        d_sc = sc[is] & 63;
-        d_mn = (sc[is] >> 6) | ((sc[is + 4] & ((is < 6) ? 0x0F : 0xF0)) >> ((is < 6) ? 0 : 2));
-    }
+    short is = (il/4) * 2;
+    q = q + (il/4) * 32 + 16 * (il&1);
+    il = il & 3;
+    const uchar2 sc = get_scale_min_k4_just2(is, il/2, xb->scales);
+    const float d   = il < 2 ? xb->d : xb->d / 16.h;
+    const float min = xb->dmin;
+    const float dl = d * sc[0];
+    const float ml = min * sc[1];
 
-    half d = qb->d;
-    half dmin = qb->dmin;
-    half scale = d * (half)d_sc;
-    half mn = dmin * (half)d_mn;
-
-    int shift = (il % 2) * 4;
-    for (int i = 0; i < 16; i++) {
-        int qi = q[i];
-        half v = scale * (half)((qi >> shift) & 0xF) - mn;
-        reg[i / 4][i % 4] = v;
+    const ushort mask = il<2 ? 0x0F : 0xF0;
+    for (int i = 0; i < 16; ++i) {
+        reg[i/4][i%4] = dl * (q[i] & mask) - ml;
     }
 }
 
-// Routed MoE matmul kernel for Q4_K weights.
-// route_counts[expert_id] = number of tokens for this expert
-// route_indices[offset + i] = (token_idx, expert_slot) packed as uint
-// Rust pre-computes offset = sum of counts for experts < expert_id
+// ── Routed MoE kernel ──
+// Identical to candle's kernel_mul_mm_id_impl but:
+// - rowids is `device const` (pre-built by Rust) not `threadgroup` (built in-kernel)
+// - expert routing is pre-computed: rowids[i] = (expert_slot, token_idx)
+//
+// Grid: (ceil(n_tokens_for_expert/32), ceil(n_out/64), n_experts)
+// Threads: 128
 kernel void moe_mm_q4k_routed(
-    device const  uchar  * all_weights     [[buffer(0)]],  // [n_experts, n_out, n_in] Q4_K
-    device const  float  * all_inputs      [[buffer(1)]],  // [batch_total, n_in] f32
-    device        float  * all_outputs     [[buffer(2)]],  // [batch * topk, n_out] f32
-    device const  uint   * route_counts    [[buffer(3)]],  // [n_experts] token count per expert
-    device const  uint   * route_tok_ids   [[buffer(4)]],  // [total_pairs] token indices (flat)
-    device const  uint   * route_pair_ids  [[buffer(5)]],  // [total_pairs] output pair indices
-    device const  uint   * route_offsets   [[buffer(6)]],  // [n_experts] cumulative offset into route arrays
-    constant      int    & n_out           [[buffer(7)]],  // output dimension
-    constant      int    & n_in            [[buffer(8)]],  // input dimension
-    threadgroup   uchar  * shared_memory   [[threadgroup(0)]],
+    device const  uchar   * all_weights    [[buffer(0)]],  // [n_experts, n_out, n_in] Q4_K
+    device const  float   * all_inputs     [[buffer(1)]],  // [total_input_rows, n_in] f32
+    device        float   * all_outputs    [[buffer(2)]],  // output
+    device const  uint    * route_counts   [[buffer(3)]],  // [n_experts] count per expert
+    device const  ushort2 * route_rowids   [[buffer(4)]],  // [total_pairs] (slot, token) per pair
+    device const  uint    * route_offsets  [[buffer(5)]],  // [n_experts] cumulative offset
+    constant      int64_t & ne00           [[buffer(6)]],  // n_in (K)
+    constant      int64_t & ne0            [[buffer(7)]],  // n_out (N)
+    constant      uint64_t& nb01           [[buffer(8)]],  // bytes per weight row
+    constant      int64_t & ne11           [[buffer(9)]],  // input rows per token group (1 or topk)
+    constant      uint64_t& nb10           [[buffer(10)]], // bytes per input element (4 for f32)
+    constant      uint64_t& nb11           [[buffer(11)]], // bytes per input row
+    constant      uint64_t& nb12           [[buffer(12)]], // bytes per input token group
+    constant      int64_t & ne0ne1         [[buffer(13)]], // ne0 * output_stride
+    threadgroup   uchar   * shared_memory  [[threadgroup(0)]],
     uint3 tgpig [[threadgroup_position_in_grid]],
     uint  tiitg [[thread_index_in_threadgroup]],
     uint  sgitg [[simdgroup_index_in_threadgroup]]
 ) {
     const uint expert_id = tgpig.z;
-    const uint n_tokens_for_expert = route_counts[expert_id];
+    const uint ne1 = route_counts[expert_id];  // tokens for this expert
+    if (ne1 == 0) return;
 
-    if (n_tokens_for_expert == 0) return;
+    const uint route_off = route_offsets[expert_id];
 
-    const uint route_offset = route_offsets[expert_id];
-    const uint r0 = tgpig.y; // output tile row
-    const uint r1 = tgpig.x; // token tile col
-
-    if (r1 * BLOCK_SIZE_N >= n_tokens_for_expert) return;
-
-    short n_rows = (n_out - (int)(r0 * BLOCK_SIZE_M) < BLOCK_SIZE_M)
-                 ? (n_out - (int)(r0 * BLOCK_SIZE_M)) : BLOCK_SIZE_M;
-    short n_cols = ((int)n_tokens_for_expert - (int)(r1 * BLOCK_SIZE_N) < BLOCK_SIZE_N)
-                 ? ((int)n_tokens_for_expert - (int)(r1 * BLOCK_SIZE_N)) : BLOCK_SIZE_N;
-
-    short thread_row = ((short)tiitg / THREAD_PER_ROW) < n_rows
-                     ? ((short)tiitg / THREAD_PER_ROW) : n_rows - 1;
-    short thread_col = ((short)tiitg / THREAD_PER_COL) < n_cols
-                     ? ((short)tiitg / THREAD_PER_COL) : n_cols - 1;
-
-    // Simdgroup matrix accumulators
-    simdgroup_half8x8  ma[4];
-    simdgroup_float8x8 mb[2];
-    simdgroup_float8x8 c_res[8];
-    for (int i = 0; i < 8; i++) {
-        c_res[i] = make_filled_simdgroup_matrix<float, 8>(0.f);
-    }
+    // rowids for this expert — device memory, no 32KB limit
+    device const ushort2 * rowids = route_rowids + route_off;
 
     // Weight pointer for this expert
-    const int blocks_per_row = n_in / QK_K;
-    const int expert_stride = n_out * blocks_per_row * (int)sizeof(block_q4_K);
-
-    short il = (tiitg % THREAD_PER_ROW);
-    constexpr short nl = 2; // Q4_K: 2 half-blocks per full block
-    short offset1 = il / nl;
-
-    device const block_q4_K * x = (device const block_q4_K *)(
-        all_weights + expert_id * expert_stride
-        + (r0 * BLOCK_SIZE_M + thread_row) * blocks_per_row * sizeof(block_q4_K)
-    ) + offset1;
-
-    // Input pointer — read from routed token
-    uint local_col = r1 * BLOCK_SIZE_N + thread_col;
-    uint tok_idx = (local_col < n_tokens_for_expert)
-                 ? route_tok_ids[route_offset + local_col] : 0;
-
-    device const float * y = all_inputs
-        + tok_idx * n_in
-        + (BLOCK_SIZE_K / THREAD_PER_COL * (tiitg % THREAD_PER_COL));
+    const uint64_t nb02 = (uint64_t)ne0 * nb01;
+    device const uchar * src0 = all_weights + expert_id * nb02;
 
     threadgroup half  * sa = (threadgroup half  *)(shared_memory);
     threadgroup float * sb = (threadgroup float *)(shared_memory + 4096);
 
-    for (int loop_k = 0; loop_k < n_in; loop_k += BLOCK_SIZE_K) {
-        // Dequantize weight block into threadgroup memory
+    const uint r0 = tgpig.y;  // output tile row
+    const uint r1 = tgpig.x;  // token tile col
+
+    if (r1 * BLOCK_SIZE_N >= ne1) return;
+
+    short n_rows = (ne0 - r0 * BLOCK_SIZE_M < BLOCK_SIZE_M) ? (ne0 - r0 * BLOCK_SIZE_M) : BLOCK_SIZE_M;
+    short n_cols = (ne1 - r1 * BLOCK_SIZE_N < BLOCK_SIZE_N) ? (ne1 - r1 * BLOCK_SIZE_N) : BLOCK_SIZE_N;
+
+    short thread_row = ((short)tiitg / THREAD_PER_ROW) < n_rows ? ((short)tiitg / THREAD_PER_ROW) : n_rows - 1;
+    short thread_col = ((short)tiitg / THREAD_PER_COL) < n_cols ? ((short)tiitg / THREAD_PER_COL) : n_cols - 1;
+
+    simdgroup_half8x8     ma[4];
+    simdgroup_float8x8    mb[2];
+    simdgroup_float8x8    c_res[8];
+    for (short i = 0; i < 8; i++) {
+        c_res[i] = make_filled_simdgroup_matrix<float, 8>(0.f);
+    }
+
+    short il = (tiitg % THREAD_PER_ROW);
+    constexpr short nl = QK_NL;
+    ushort offset1 = il / nl;
+
+    device const ushort2 & id = rowids[r1 * BLOCK_SIZE_N + thread_col];
+
+    device const block_q4_K * x = (device const block_q4_K *)(src0 + (r0 * BLOCK_SIZE_M + thread_row) * nb01) + offset1;
+    device const float      * y = (device const float      *)((device const uchar *)all_inputs
+        + nb12 * id[1]
+        + nb11 * (id[0] % ne11)
+        + nb10 * (BLOCK_SIZE_K / THREAD_PER_COL * (tiitg % THREAD_PER_COL)));
+
+    for (int loop_k = 0; loop_k < ne00; loop_k += BLOCK_SIZE_K) {
         half4x4 temp_a;
         dequantize_q4_K(x, il, temp_a);
         threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -151,7 +144,6 @@ kernel void moe_mm_q4k_routed(
             +                     (tiitg / THREAD_PER_ROW) % 8  + (i & 7) * 8) = temp_a[i/4][i%4];
         }
 
-        // Load input into threadgroup memory
         *(threadgroup float2x4 *)(sb + (tiitg % THREAD_PER_COL) * 8 * 32 + 8 * (tiitg / THREAD_PER_COL))
             = *((device float2x4 *)y);
 
@@ -161,7 +153,6 @@ kernel void moe_mm_q4k_routed(
 
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
-        // Simdgroup matrix multiply-accumulate
         threadgroup half  * lsma = (sa + THREAD_MAT_M * SG_MAT_SIZE * (sgitg % 2));
         threadgroup float * lsmb = (sb + THREAD_MAT_N * SG_MAT_SIZE * (sgitg / 2));
 
@@ -173,48 +164,36 @@ kernel void moe_mm_q4k_routed(
             for (int i = 0; i < 2; i++) {
                 simdgroup_load(mb[i], lsmb + SG_MAT_SIZE * i);
             }
-            simdgroup_barrier(mem_flags::mem_none);
+
+            lsma += BLOCK_SIZE_M / SG_MAT_ROW * SG_MAT_SIZE;
+            lsmb += BLOCK_SIZE_N / SG_MAT_ROW * SG_MAT_SIZE;
 
             for (int i = 0; i < 8; i++) {
                 simdgroup_multiply_accumulate(c_res[i], mb[i/4], ma[i%4], c_res[i]);
             }
-
-            lsma += BLOCK_SIZE_M / SG_MAT_SIZE * SG_MAT_SIZE;
-            lsmb += BLOCK_SIZE_N / SG_MAT_SIZE * SG_MAT_SIZE;
         }
     }
 
-    // Write results — scatter to correct output positions
-    threadgroup float * temp_str = (threadgroup float *)shared_memory;
-
-    if ((sgitg / 2) == 0) {
+    // Write results — scatter to correct output positions via rowids
+    {
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        threadgroup float * temp_str = ((threadgroup float *)shared_memory)
+                                      + 32 * (sgitg & 1) + (16 * (sgitg >> 1)) * BLOCK_SIZE_M;
         for (int i = 0; i < 8; i++) {
-            simdgroup_store(c_res[i], temp_str + 8 * (sgitg % 2) + (i % 4) * BLOCK_SIZE_M + (i / 4) * 8, BLOCK_SIZE_M);
+            simdgroup_store(c_res[i], temp_str + 8 * (i % 4) + 8 * BLOCK_SIZE_M * (i / 4), BLOCK_SIZE_M);
         }
-    }
 
-    threadgroup_barrier(mem_flags::mem_threadgroup);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    if ((sgitg / 2) == 1) {
-        for (int i = 0; i < 8; i++) {
-            simdgroup_store(c_res[i], temp_str + 8 * (sgitg % 2) + (i % 4) * BLOCK_SIZE_M + (i / 4) * 8, BLOCK_SIZE_M);
+        device float * C = all_outputs + (BLOCK_SIZE_M * r0);
+        if (sgitg == 0) {
+            for (int j = tiitg; j < n_cols; j += BLOCK_SIZE_N) {
+                device const ushort2 & jid = rowids[r1 * BLOCK_SIZE_N + j];
+                int joff = jid[0] * ne0 + jid[1] * ne0ne1;
+                for (int i = 0; i < n_rows; i++) {
+                    *(C + i + joff) = *(temp_str + i + j * BLOCK_SIZE_M);
+                }
+            }
         }
-    }
-
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    // Write to output using scattered pair indices
-    for (int j = tiitg; j < n_cols * n_rows; j += 128) {
-        int col = j / n_rows;
-        int row = j % n_rows;
-
-        uint local_idx = r1 * BLOCK_SIZE_N + col;
-        if (local_idx >= n_tokens_for_expert) continue;
-
-        uint pair_idx = route_pair_ids[route_offset + local_idx];
-        int out_row = r0 * BLOCK_SIZE_M + row;
-        if (out_row >= n_out) continue;
-
-        all_outputs[pair_idx * n_out + out_row] = *(temp_str + col * BLOCK_SIZE_M + row);
     }
 }
