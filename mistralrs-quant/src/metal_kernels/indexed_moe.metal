@@ -169,7 +169,7 @@ kernel void moe_mm_q4k_routed(
             lsmb += BLOCK_SIZE_N / SG_MAT_ROW * SG_MAT_SIZE;
 
             for (int i = 0; i < 8; i++) {
-                simdgroup_multiply_accumulate(c_res[i], mb[i/4], ma[i%4], c_res[i]);
+                simdgroup_multiply_accumulate(c_res[i], ma[i/4], mb[i%4], c_res[i]);
             }
         }
     }
