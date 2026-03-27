@@ -152,7 +152,7 @@ fn dispatch_tiled_moe(
     // rowids = ushort2(expert_slot, token_idx) matching kernel's expected format
     let mut route_counts = vec![0u32; n_experts];
     let mut route_offsets = vec![0u32; n_experts];
-    let mut rowids_flat: Vec<u16> = Vec::with_capacity(total_pairs * 2); // ushort2 = 2 × u16
+    let mut rowids_packed: Vec<u32> = Vec::with_capacity(total_pairs); // ushort2 packed as u32
     let mut max_tokens_per_expert = 0usize;
 
     let mut offset = 0u32;
@@ -161,10 +161,10 @@ fn dispatch_tiled_moe(
         route_offsets[eid] = offset;
         max_tokens_per_expert = max_tokens_per_expert.max(pairs.len());
         for &(tok_idx, pair_idx) in pairs {
-            // ushort2: [0] = expert_slot (pair_idx % topk), [1] = token_idx
+            // ushort2 packed as u32: low 16 bits = slot, high 16 bits = token_idx
             let slot = (pair_idx as usize % topk) as u16;
-            rowids_flat.push(slot);
-            rowids_flat.push(tok_idx as u16);
+            let packed = (slot as u32) | ((tok_idx as u32 & 0xFFFF) << 16);
+            rowids_packed.push(packed);
         }
         offset += pairs.len() as u32;
     }
@@ -173,8 +173,8 @@ fn dispatch_tiled_moe(
     let device = x_flat.device();
     let counts_t = Tensor::new(route_counts, device)?;
     let offsets_t = Tensor::new(route_offsets, device)?;
-    // rowids as raw u16 pairs — kernel reads as ushort2
-    let rowids_t = Tensor::new(rowids_flat, device)?;
+    // rowids packed as u32 — kernel reads as ushort2 (same memory layout)
+    let rowids_t = Tensor::new(rowids_packed, device)?;
 
     let x_flat = x_flat.contiguous()?.to_dtype(DType::F32)?;
     let output = Tensor::zeros((total_pairs, n_out), DType::F32, device)?;
