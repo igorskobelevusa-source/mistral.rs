@@ -117,8 +117,34 @@ fn dispatch_quantized_moe(qtensor: &Arc<QTensor>, x: &Tensor, ids: &Tensor) -> R
 
     // For single-token decode, use mv_id (fast for matvec)
     // For prefill (many tokens), use custom tiled kernel
-    // Tiled kernel still has bugs — use mv_id for everything.
-    // TODO: fix tiled kernel output addressing / dequant for Q4K
+    // Debug: run BOTH kernels and compare output
+    let debug_tiled = batch > 4 && ggml_dtype == GgmlDType::Q4K;
+    if debug_tiled {
+        let tiled = dispatch_tiled_moe(dev, w_buf, ggml_dtype, n_experts, n_out, n_in, &x_flat, ids, batch, topk, input_dim1, x.dims());
+        let mvid = dispatch_mv_id_moe(dev, w_buf, ggml_dtype, n_experts, n_out, n_in, &x_flat, ids, batch, topk, input_dim1, x.dims());
+        match (&tiled, &mvid) {
+            (Ok(t), Ok(m)) => {
+                let diff = (t - m).unwrap_or_else(|_| t.clone()).abs().unwrap_or_else(|_| t.clone());
+                let max_diff: f32 = diff.max(0).unwrap_or_else(|_| Tensor::new(&[0f32], x.device()).unwrap()).to_vec1().unwrap_or(vec![f32::NAN])[0];
+                let t_sum: f32 = t.abs().unwrap_or_else(|_| t.clone()).sum_all().unwrap_or_else(|_| Tensor::new(&[0f32], x.device()).unwrap()).to_vec0().unwrap_or(f32::NAN);
+                let m_sum: f32 = m.abs().unwrap_or_else(|_| m.clone()).sum_all().unwrap_or_else(|_| Tensor::new(&[0f32], x.device()).unwrap()).to_vec0().unwrap_or(f32::NAN);
+                tracing::warn!(max_diff, tiled_sum=t_sum, mvid_sum=m_sum, "TILED_VS_MVID_COMPARE");
+                if max_diff.is_nan() || max_diff > 1.0 {
+                    tracing::warn!("Tiled kernel diverged, using mv_id");
+                    return mvid;
+                }
+                return tiled;
+            }
+            (Err(e), _) => {
+                tracing::warn!(error=%e, "Tiled kernel failed, falling back to mv_id");
+                return mvid.map_err(|e2| candle_core::Error::Msg(format!("Both failed: tiled={e}, mvid={e2}")))?;
+            }
+            (_, Err(e)) => {
+                tracing::warn!(error=%e, "mv_id failed");
+                return tiled;
+            }
+        }
+    }
     let use_tiled = false;
 
     if use_tiled {
