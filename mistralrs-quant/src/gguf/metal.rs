@@ -164,7 +164,8 @@ fn dispatch_quantized_moe(qtensor: &Arc<QTensor>, x: &Tensor, ids: &Tensor) -> R
 
     let pipeline = dev
         .kernels()
-        .load_pipeline(dev.device(), Source::Quantized, kernel_name)?;
+        .load_pipeline(dev.device(), Source::Quantized, kernel_name)
+        .map_err(|e| candle_core::Error::Msg(format!("MoE kernel load failed: {e}")))?;
 
     let encoder = dev.command_encoder()?;
     let encoder: &ComputeCommandEncoder = encoder.as_ref();
