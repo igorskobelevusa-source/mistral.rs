@@ -196,8 +196,8 @@ fn dispatch_quantized_moe(qtensor: &Arc<QTensor>, x: &Tensor, ids: &Tensor) -> R
 
     // mm_id needs threadgroup memory: 8192 bytes for tiling + rowids
     // rowids = 4 bytes per (token, slot) pair
-    let rowids_size = (batch * topk * 4) as u64;
-    encoder.set_threadgroup_memory_length(0, (8192 + rowids_size) as u64);
+    let rowids_size = batch * topk * 4;
+    encoder.set_threadgroup_memory_length(0, 8192 + rowids_size);
 
     encoder.dispatch_thread_groups(thread_groups, threads_per_group);
 
