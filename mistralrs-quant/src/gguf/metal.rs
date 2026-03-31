@@ -357,7 +357,7 @@ fn dispatch_mv_id_moe(
     let nb1 = (n_out * 4) as u64;
 
     let (nth0, nth1, align) = match ggml_dtype {
-        GgmlDType::Q4K => (4usize, 8usize, 4usize),
+        GgmlDType::Q4K => (32usize, 2usize, 4usize), // 2 simdgroups × 32 threads = 64
         GgmlDType::Q2K => (2, 32, 4),
         GgmlDType::Q3K | GgmlDType::Q5K => (2, 32, 4),
         GgmlDType::Q6K => (2, 32, 2),
