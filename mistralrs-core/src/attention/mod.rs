@@ -123,13 +123,6 @@ impl Sdpa {
         let (_, _, _, k_head_dim) = k.dims4()?;
         let (_, _, _, v_head_dim) = v.dims4()?;
 
-        // MLX steel flash attention for Metal (prefill only — decode uses vector SDPA)
-        #[cfg(feature = "mlx")]
-        if q.device().is_metal() && seq_len > 1 && sdpa_params.softcap.is_none() {
-            tracing::debug!(seq_len, head_dim, "mlx_sdpa_dispatch");
-            return backends::mlx_sdpa::mlx_sdpa(q, k, v, sdpa_params.softmax_scale);
-        }
-
         let can_use_flash = q.device().is_cpu()
             || q.device().is_cuda() && crate::using_flash_attn() && q.dtype() != DType::F32;
 
@@ -191,13 +184,7 @@ impl Sdpa {
             mask.layout().broadcast_as(tgt_mask_shape.clone()).is_ok()
                 && sdpa_params.softcap.is_none_or(|x| x == 1.0)
         });
-        let valid_head_dims: &[usize] = if seq_len == 1 {
-            &[32, 64, 72, 80, 96, 128, 256]
-        } else {
-            // Not sure why the full kernel doesn't like 256.
-            // [32, 64, 72, 80, 96, 128, 256]
-            &[32, 64, 72, 80, 96, 128]
-        };
+        let valid_head_dims: &[usize] = &[32, 64, 72, 80, 96, 128, 256];
         if [q, k, v].into_iter().all(|x| x.device().is_metal())
             && all_head_dims_match
             && valid_head_dims.contains(&head_dim)
