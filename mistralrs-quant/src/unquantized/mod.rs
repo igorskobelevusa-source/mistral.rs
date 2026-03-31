@@ -157,6 +157,22 @@ impl QuantMethod for UnquantLinear {
             &[b_size, seq_len, 1, 1, hidden_dim] => {
                 let (_b, _s, num_experts_per_tok) = indices.dims3()?;
                 let n = b_size * seq_len;
+
+                // Fast path: single-token decode — one batched matmul over all active experts
+                if n == 1 {
+                    let flat_indices = indices.reshape((num_experts_per_tok,))?;
+                    // Gather active expert weights: [k, out_features, in_features]
+                    let selected_w = w.index_select(&flat_indices, 0)?;
+                    // Input [1, hidden_dim] -> broadcast [k, 1, hidden_dim]
+                    let a_flat = a.reshape((1, hidden_dim))?;
+                    let a_expanded = a_flat
+                        .unsqueeze(0)?
+                        .broadcast_as((num_experts_per_tok, 1, hidden_dim))?;
+                    // Batched matmul: [k, 1, in] @ [k, in, out] -> [k, 1, out]
+                    let result = a_expanded.matmul(&selected_w.transpose(1, 2)?)?;
+                    return result.squeeze(1)?.reshape((b_size, seq_len, num_experts_per_tok, out_features));
+                }
+
                 let a_flat = a.reshape((n, hidden_dim))?; // [n, in]
                 let flat_indices = indices.reshape((n * num_experts_per_tok,))?;
                 let idx_vec: Vec<u32> = flat_indices.to_vec1()?;
@@ -199,6 +215,19 @@ impl QuantMethod for UnquantLinear {
                 if num_experts_per_tok > 1 =>
             {
                 let n = b_size * seq_len;
+
+                // Fast path: single-token decode — batched matmul
+                if n == 1 {
+                    let flat_indices = indices.reshape((num_experts_per_tok,))?;
+                    let selected_w = w.index_select(&flat_indices, 0)?; // [k, out, in]
+                    // Each expert slot has its own input: [k, hidden_dim] -> [k, 1, hidden_dim]
+                    let a_flat = a.reshape((num_experts_per_tok, hidden_dim))?
+                        .unsqueeze(1)?;
+                    // [k, 1, in] @ [k, in, out] -> [k, 1, out]
+                    let result = a_flat.matmul(&selected_w.transpose(1, 2)?)?;
+                    return result.squeeze(1)?.reshape((b_size, seq_len, num_experts_per_tok, out_features));
+                }
+
                 let flat_indices = indices.reshape((n * num_experts_per_tok,))?;
                 let idx_vec: Vec<u32> = flat_indices.to_vec1()?;
                 let a_flat = a.reshape((n * num_experts_per_tok, hidden_dim))?; // [n*k, in]
