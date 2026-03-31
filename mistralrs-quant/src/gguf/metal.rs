@@ -93,6 +93,75 @@ pub fn metal_indexed_moe_forward(
     }
 }
 
+/// Fused gate+up+SiLU dispatch: silu(gate_proj @ x) * (up_proj @ x) in one Metal kernel.
+/// Returns the activated result ready for down_proj.
+pub fn metal_fused_gate_up_swiglu(
+    gate_qt: &Arc<QTensor>,
+    up_qt: &Arc<QTensor>,
+    x: &Tensor,
+    ids: &Tensor,
+) -> Result<Tensor> {
+    let Device::Metal(dev) = x.device() else {
+        candle_core::bail!("expected Metal device for fused MoE");
+    };
+
+    let (gate_buf, gate_dtype) = qtensor_metal_buffer(gate_qt)?;
+    let (up_buf, up_dtype) = qtensor_metal_buffer(up_qt)?;
+
+    if gate_dtype != GgmlDType::Q4K || up_dtype != GgmlDType::Q4K {
+        candle_core::bail!("fused_gate_up_swiglu only supports Q4K, got {gate_dtype:?}/{up_dtype:?}");
+    }
+
+    let (n_experts, n_out, n_in) = match gate_qt.shape().dims() {
+        &[e, o, i] => (e, o, i),
+        d => candle_core::bail!("Expected 3D gate weights, got {d:?}"),
+    };
+
+    let (batch, topk, input_dim1, x_flat) = match x.dims() {
+        &[b, s, 1, 1, h] => { let (_, _, k) = ids.dims3()?; (b*s, k, 1usize, x.reshape((b*s, h))?) }
+        &[b, s, k, h] if k > 1 => (b*s, k, k, x.reshape((b*s*k, h))?),
+        &[n, 1, h] => { let (_, k) = ids.dims2()?; (n, k, 1, x.reshape((n, h))?) }
+        d => candle_core::bail!("unsupported input shape for fused MoE: {d:?}"),
+    };
+
+    let x_flat = x_flat.contiguous()?.to_dtype(DType::F32)?;
+    let flat_ids = ids.reshape((batch, topk))?.to_dtype(DType::U32)?.contiguous()?;
+    let output = Tensor::zeros((batch * topk, n_out), DType::F32, x_flat.device())?;
+
+    let (x_buf, x_off) = metal_buffer_and_offset(&x_flat)?;
+    let (id_buf, id_off) = metal_buffer_and_offset(&flat_ids)?;
+    let (out_buf, _out_off) = metal_buffer_and_offset(&output)?;
+
+    let block_size = gate_dtype.block_size();
+    let type_size = gate_dtype.type_size();
+    let blocks_per_row = n_in / block_size;
+    let nb01 = (blocks_per_row * type_size) as u64;
+    let nb02 = (n_out as u64) * nb01;
+
+    candle_metal_kernels::call_fused_moe_swiglu(
+        dev.device(),
+        &dev.command_encoder()?,
+        dev.kernels(),
+        candle_metal_kernels::GgmlDType::Q4K,
+        &gate_buf,
+        &up_buf,
+        &x_buf,
+        x_off,
+        &id_buf,
+        id_off,
+        &out_buf,
+        n_out,
+        n_in,
+        batch,
+        topk,
+        input_dim1,
+        nb01,
+        nb02,
+    ).map_err(|e| candle_core::Error::Msg(format!("fused_moe_swiglu dispatch: {e}")))?;
+
+    reshape_output(&output, x.dims(), ids)
+}
+
 // ── Quantized MoE dispatch ──
 
 fn dispatch_quantized_moe(qtensor: &Arc<QTensor>, x: &Tensor, ids: &Tensor) -> Result<Tensor> {

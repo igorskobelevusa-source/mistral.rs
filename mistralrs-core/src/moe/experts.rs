@@ -504,24 +504,43 @@ impl MoEExperts {
                 .gather_forward_autocast(&(up * gate.apply(&self.act)?)?, topk_ids)?
         } else {
             // Metal path: use broadcast gather shapes.
-            // Convert to F32 once at the boundary instead of per-projection via autocast.
-            // This saves 4 dtype conversion dispatches per MoE layer (160 total across 40 layers).
             let act_dtype = weights.fused_gate_proj.quantized_act_type();
+            let xs_5d = xs.reshape((b_size, seq_len, 1, 1, hidden_dim))?;
             let xs_act = if let Some(dt) = act_dtype {
-                xs.reshape((b_size, seq_len, 1, 1, hidden_dim))?.to_dtype(dt)?
+                xs_5d.to_dtype(dt)?
             } else {
-                xs.reshape((b_size, seq_len, 1, 1, hidden_dim))?
+                xs_5d
             };
             let indices = topk_ids.reshape((b_size, seq_len, self.num_experts_per_tok))?;
-            let gate = weights
-                .fused_gate_proj
-                .gather_forward(&xs_act, &indices)?;
-            let up = weights
-                .fused_up_proj
-                .gather_forward(&xs_act, &indices)?;
+
+            // Try fused gate+up+SiLU kernel (single dispatch instead of 3)
+            #[cfg(feature = "metal")]
+            let gated = {
+                let gate_qt = weights.fused_gate_proj.moe_qtensor();
+                let up_qt = weights.fused_up_proj.moe_qtensor();
+                if let (Some(gq), Some(uq)) = (gate_qt, up_qt) {
+                    // Fused path: silu(gate @ x) * (up @ x) in one Metal kernel
+                    Some(mistralrs_quant::metal_fused_gate_up_swiglu(gq, uq, &xs_act, &indices)?)
+                } else {
+                    None
+                }
+            };
+            #[cfg(not(feature = "metal"))]
+            let gated: Option<Tensor> = None;
+
+            let gated = match gated {
+                Some(g) => g,
+                None => {
+                    // Fallback: separate gate + up + activation
+                    let gate = weights.fused_gate_proj.gather_forward(&xs_act, &indices)?;
+                    let up = weights.fused_up_proj.gather_forward(&xs_act, &indices)?;
+                    (up * gate.apply(&self.act)?)?
+                }
+            };
+
             let xs = weights
                 .fused_down_proj
-                .gather_forward(&(up * gate.apply(&self.act)?)?, &indices)?;
+                .gather_forward(&gated, &indices)?;
             xs.squeeze(D::Minus2)?
                 .reshape((num_tokens, self.num_experts_per_tok, hidden_dim))?
         };

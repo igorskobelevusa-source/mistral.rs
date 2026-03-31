@@ -6,6 +6,8 @@ mod cuda;
 mod ffi;
 #[cfg(feature = "metal")]
 mod metal;
+#[cfg(feature = "metal")]
+pub use metal::metal_fused_gate_up_swiglu;
 
 use std::{
     borrow::Cow,
@@ -112,6 +114,13 @@ impl QuantMethod for GgufMatMul {
 
     fn quantized_act_type(&self) -> Option<DType> {
         Some(DType::F32)
+    }
+
+    fn moe_qtensor(&self) -> Option<&std::sync::Arc<candle_core::quantized::QTensor>> {
+        match &self.w {
+            QMatMul::QTensor(qt) => Some(qt),
+            _ => None,
+        }
     }
 
     fn add_delta_w(&self, delta: &Tensor) -> Result<Arc<dyn QuantMethod>> {
