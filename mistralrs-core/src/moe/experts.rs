@@ -503,23 +503,32 @@ impl MoEExperts {
                 .fused_down_proj
                 .gather_forward_autocast(&(up * gate.apply(&self.act)?)?, topk_ids)?
         } else {
-            // Metal path: use broadcast gather shapes
-            let xs = xs.reshape((b_size, seq_len, 1, 1, hidden_dim))?;
+            // Metal path: use broadcast gather shapes.
+            // Convert to F32 once at the boundary instead of per-projection via autocast.
+            // This saves 4 dtype conversion dispatches per MoE layer (160 total across 40 layers).
+            let act_dtype = weights.fused_gate_proj.quantized_act_type();
+            let xs_act = if let Some(dt) = act_dtype {
+                xs.reshape((b_size, seq_len, 1, 1, hidden_dim))?.to_dtype(dt)?
+            } else {
+                xs.reshape((b_size, seq_len, 1, 1, hidden_dim))?
+            };
             let indices = topk_ids.reshape((b_size, seq_len, self.num_experts_per_tok))?;
             let gate = weights
                 .fused_gate_proj
-                .gather_forward_autocast(&xs, &indices)?;
+                .gather_forward(&xs_act, &indices)?;
             let up = weights
                 .fused_up_proj
-                .gather_forward_autocast(&xs, &indices)?;
+                .gather_forward(&xs_act, &indices)?;
             let xs = weights
                 .fused_down_proj
-                .gather_forward_autocast(&(up * gate.apply(&self.act)?)?, &indices)?;
+                .gather_forward(&(up * gate.apply(&self.act)?)?, &indices)?;
             xs.squeeze(D::Minus2)?
                 .reshape((num_tokens, self.num_experts_per_tok, hidden_dim))?
         };
 
-        ys.to_dtype(DType::F32)?
+        // Weighted sum in F32 for precision, convert back once at the end
+        let ys_f32 = if ys.dtype() == DType::F32 { ys } else { ys.to_dtype(DType::F32)? };
+        ys_f32
             .broadcast_mul(&topk_weights.unsqueeze(D::Minus1)?)?
             .sum(D::Minus2)?
             .to_dtype(original_dtype)
