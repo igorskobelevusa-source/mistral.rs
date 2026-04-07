@@ -223,6 +223,10 @@ path = "examples/advanced/perplexity/main.rs"
 name = "embeddings"
 path = "examples/advanced/embeddings/main.rs"
 
+[[example]]
+name = "stateful_smoke"
+path = "examples/stateful_smoke.rs"
+
 # ========== Cookbook ==========
 
 [[example]]

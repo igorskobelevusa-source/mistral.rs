@@ -3,7 +3,6 @@ use mistralrs::{DecodeSessionConfig, ModelDType, TextModelBuilder};
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let model = TextModelBuilder::new("hf-internal-testing/tiny-random-LlamaForCausalLM")
-        .with_force_cpu()
         .with_dtype(ModelDType::F32)
         .build_stateful()
         .await?;
