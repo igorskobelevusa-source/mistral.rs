@@ -10,8 +10,10 @@ use std::{
     sync::Arc,
 };
 
-use crate::model_builder_trait::{build_model_from_pipeline, build_text_pipeline};
-use crate::Model;
+use crate::model_builder_trait::{
+    build_model_from_pipeline, build_stateful_model_from_pipeline, build_text_pipeline,
+};
+use crate::{Model, StatefulModel};
 
 #[derive(Clone)]
 /// Configure a text model with the various parameters for loading, running, and other inference behaviors.
@@ -200,6 +202,12 @@ impl TextModelBuilder {
     pub async fn build(self) -> anyhow::Result<Model> {
         let (pipeline, scheduler_config, add_model_config) = build_text_pipeline(self).await?;
         Ok(build_model_from_pipeline(pipeline, scheduler_config, add_model_config).await)
+    }
+
+    /// Load the text model for future external-scheduler execution.
+    pub async fn build_stateful(self) -> anyhow::Result<StatefulModel> {
+        let (pipeline, scheduler_config, add_model_config) = build_text_pipeline(self).await?;
+        Ok(build_stateful_model_from_pipeline(pipeline, scheduler_config, add_model_config).await)
     }
 }
 

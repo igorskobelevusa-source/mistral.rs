@@ -443,6 +443,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "bindgen"
+version = "0.70.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f49d8fed880d473ea71efb9bf597651e77201bdd4893efe54c9e5d65ae04ce6f"
+dependencies = [
+ "bitflags 2.10.0",
+ "cexpr",
+ "clang-sys",
+ "itertools 0.13.0",
+ "log",
+ "prettyplease",
+ "proc-macro2",
+ "quote",
+ "regex",
+ "rustc-hash 1.1.0",
+ "shlex",
+ "syn 2.0.114",
+]
+
+[[package]]
 name = "bit-set"
 version = "0.5.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -634,7 +654,7 @@ checksum = "ade8366b8bd5ba243f0a58f036cc0ca8a2f069cff1a2351ef1cac6b083e16fc0"
 [[package]]
 name = "candle-core"
 version = "0.9.2"
-source = "git+https://github.com/huggingface/candle.git?rev=c3bb5bf#c3bb5bfb90c9cb5e003a803e3d8941067f32d880"
+source = "git+https://github.com/quixantplc/candle.git?branch=quixant%2Fmetal-moe-buffer#53a4e32104d431ca11d6c9502f6dfb0cd6be1750"
 dependencies = [
  "accelerate-src",
  "byteorder",
@@ -665,7 +685,7 @@ dependencies = [
 [[package]]
 name = "candle-flash-attn"
 version = "0.9.2"
-source = "git+https://github.com/huggingface/candle.git?rev=c3bb5bf#c3bb5bfb90c9cb5e003a803e3d8941067f32d880"
+source = "git+https://github.com/quixantplc/candle.git?branch=quixant%2Fmetal-moe-buffer#53a4e32104d431ca11d6c9502f6dfb0cd6be1750"
 dependencies = [
  "anyhow",
  "candle-core",
@@ -676,7 +696,7 @@ dependencies = [
 [[package]]
 name = "candle-flash-attn-v3"
 version = "0.9.2"
-source = "git+https://github.com/huggingface/candle.git?rev=c3bb5bf#c3bb5bfb90c9cb5e003a803e3d8941067f32d880"
+source = "git+https://github.com/quixantplc/candle.git?branch=quixant%2Fmetal-moe-buffer#53a4e32104d431ca11d6c9502f6dfb0cd6be1750"
 dependencies = [
  "anyhow",
  "candle-core",
@@ -689,7 +709,7 @@ dependencies = [
 [[package]]
 name = "candle-kernels"
 version = "0.9.2"
-source = "git+https://github.com/huggingface/candle.git?rev=c3bb5bf#c3bb5bfb90c9cb5e003a803e3d8941067f32d880"
+source = "git+https://github.com/quixantplc/candle.git?branch=quixant%2Fmetal-moe-buffer#53a4e32104d431ca11d6c9502f6dfb0cd6be1750"
 dependencies = [
  "cudaforge",
 ]
@@ -697,7 +717,7 @@ dependencies = [
 [[package]]
 name = "candle-metal-kernels"
 version = "0.9.2"
-source = "git+https://github.com/huggingface/candle.git?rev=c3bb5bf#c3bb5bfb90c9cb5e003a803e3d8941067f32d880"
+source = "git+https://github.com/quixantplc/candle.git?branch=quixant%2Fmetal-moe-buffer#53a4e32104d431ca11d6c9502f6dfb0cd6be1750"
 dependencies = [
  "half",
  "objc2",
@@ -711,7 +731,7 @@ dependencies = [
 [[package]]
 name = "candle-nn"
 version = "0.9.2"
-source = "git+https://github.com/huggingface/candle.git?rev=c3bb5bf#c3bb5bfb90c9cb5e003a803e3d8941067f32d880"
+source = "git+https://github.com/quixantplc/candle.git?branch=quixant%2Fmetal-moe-buffer#53a4e32104d431ca11d6c9502f6dfb0cd6be1750"
 dependencies = [
  "accelerate-src",
  "candle-core",
@@ -730,7 +750,7 @@ dependencies = [
 [[package]]
 name = "candle-ug"
 version = "0.9.2"
-source = "git+https://github.com/huggingface/candle.git?rev=c3bb5bf#c3bb5bfb90c9cb5e003a803e3d8941067f32d880"
+source = "git+https://github.com/quixantplc/candle.git?branch=quixant%2Fmetal-moe-buffer#53a4e32104d431ca11d6c9502f6dfb0cd6be1750"
 dependencies = [
  "ug",
  "ug-cuda",
@@ -763,6 +783,15 @@ name = "cesu8"
 version = "1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6d43a04d8753f35258c91f8ec639f792891f748a1edbd759cf1dcea3382ad83c"
+
+[[package]]
+name = "cexpr"
+version = "0.6.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6fac387a98bb7c37292057cffc56d62ecb629900026402633ae9160df93a8766"
+dependencies = [
+ "nom 7.1.3",
+]
 
 [[package]]
 name = "cfg-if"
@@ -812,6 +841,17 @@ checksum = "a6139a8597ed92cf816dfb33f5dd6cf0bb93a6adc938f11039f371bc5bcd26c3"
 dependencies = [
  "chrono",
  "phf 0.12.1",
+]
+
+[[package]]
+name = "clang-sys"
+version = "1.8.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0b023947811758c97c59bf9d1c188fd619ad4718dcaa767947df1cadb14f39f4"
+dependencies = [
+ "glob",
+ "libc",
+ "libloading 0.8.9",
 ]
 
 [[package]]
@@ -3011,6 +3051,15 @@ checksum = "a6cb138bb79a146c1bd460005623e142ef0181e3d0219cb493e02f7d08a35695"
 
 [[package]]
 name = "itertools"
+version = "0.13.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "413ee7dfc52ee1a4949ceeb7dbc8a33f2d6c088194d9f922fb8318faf1f01186"
+dependencies = [
+ "either",
+]
+
+[[package]]
+name = "itertools"
 version = "0.14.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2b192c782037fadd9cfa75548310488aabdbf3d2da73885b31bd0abd03351285"
@@ -3212,6 +3261,15 @@ name = "mac"
 version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c41e0c4fef86961ac6d6f8a82609f55f31b05e4fce149ac5710e439df7619ba4"
+
+[[package]]
+name = "mach-sys"
+version = "0.5.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "48460c2e82a3a0de197152fdf8d2c2d5e43adc501501553e439bf2156e6f87c7"
+dependencies = [
+ "fastrand",
+]
 
 [[package]]
 name = "macro_rules_attribute"
@@ -3540,7 +3598,7 @@ dependencies = [
  "indicatif 0.18.3",
  "intel-mkl-src",
  "interprocess",
- "itertools",
+ "itertools 0.14.0",
  "libc",
  "llguidance",
  "lrtable",
@@ -3551,6 +3609,7 @@ dependencies = [
  "mistralrs-paged-attn",
  "mistralrs-quant",
  "mistralrs-vision",
+ "mlx-rs",
  "num-traits",
  "objc",
  "objc2-metal",
@@ -3661,7 +3720,7 @@ dependencies = [
  "image",
  "indexmap 2.13.0",
  "intel-mkl-src",
- "itertools",
+ "itertools 0.14.0",
  "mistralrs-core",
  "mistralrs-mcp",
  "pyo3",
@@ -3740,7 +3799,7 @@ dependencies = [
  "image",
  "indexmap 2.13.0",
  "intel-mkl-src",
- "itertools",
+ "itertools 0.14.0",
  "mistralrs-core",
  "reqwest 0.13.1",
  "serde",
@@ -3788,6 +3847,66 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "uuid 1.19.0",
+]
+
+[[package]]
+name = "mlx-internal-macros"
+version = "0.25.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7a7c4444d624bf6b93db5cc22ebff4fdfa13593fd56154fe33b1f302a557c2c6"
+dependencies = [
+ "darling 0.21.3",
+ "itertools 0.14.0",
+ "proc-macro2",
+ "quote",
+ "syn 2.0.114",
+]
+
+[[package]]
+name = "mlx-macros"
+version = "0.25.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a819ee8b4434690572b6feb9c3ef0b6e90137e4190b340cf00150703b410aaf9"
+dependencies = [
+ "darling 0.21.3",
+ "proc-macro2",
+ "quote",
+ "syn 2.0.114",
+]
+
+[[package]]
+name = "mlx-rs"
+version = "0.25.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f3a0f592c5839b0237b3072530b1d3c503923579a2009ee0761df3edd1b1f27b"
+dependencies = [
+ "dyn-clone",
+ "half",
+ "itertools 0.14.0",
+ "libc",
+ "mach-sys",
+ "mlx-internal-macros",
+ "mlx-macros",
+ "mlx-sys",
+ "num-complex",
+ "num-traits",
+ "num_enum",
+ "parking_lot",
+ "paste",
+ "smallvec 1.15.1",
+ "strum 0.27.2",
+ "thiserror 2.0.18",
+]
+
+[[package]]
+name = "mlx-sys"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2e3bc3880111918b2d5018f845d48fd995f9901f16efc81d1fcfd2f4210b8219"
+dependencies = [
+ "bindgen",
+ "cc",
+ "cmake",
 ]
 
 [[package]]
@@ -4044,6 +4163,28 @@ checksum = "91df4bbde75afed763b708b7eee1e8e7651e02d97f6d5dd763e89367e957b23b"
 dependencies = [
  "hermit-abi",
  "libc",
+]
+
+[[package]]
+name = "num_enum"
+version = "0.7.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5d0bca838442ec211fa11de3a8b0e0e8f3a4522575b5c4c06ed722e005036f26"
+dependencies = [
+ "num_enum_derive",
+ "rustversion",
+]
+
+[[package]]
+name = "num_enum_derive"
+version = "0.7.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "680998035259dcfcafe653688bf2aa6d3e2dc05e98be6ab46afb089dc84f1df8"
+dependencies = [
+ "proc-macro-crate",
+ "proc-macro2",
+ "quote",
+ "syn 2.0.114",
 ]
 
 [[package]]
@@ -4424,12 +4565,31 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "925383efa346730478fb4838dbe9137d2a47675ad789c546d150a6e1dd4ab31c"
 
 [[package]]
+name = "prettyplease"
+version = "0.2.37"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "479ca8adacdd7ce8f1fb39ce9ecccbfe93a3f1344b3d0d97f20bc0196208f62b"
+dependencies = [
+ "proc-macro2",
+ "syn 2.0.114",
+]
+
+[[package]]
 name = "primal-check"
 version = "0.3.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "dc0d895b311e3af9902528fbb8f928688abbd95872819320517cc24ca6b2bd08"
 dependencies = [
  "num-integer",
+]
+
+[[package]]
+name = "proc-macro-crate"
+version = "3.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "219cb19e96be00ab2e37d6e299658a0cfa83e52429179969b0f0121b4ac46983"
+dependencies = [
+ "toml_edit 0.23.10+spec-1.0.0",
 ]
 
 [[package]]
@@ -4825,7 +4985,7 @@ dependencies = [
  "built",
  "cfg-if",
  "interpolate_name",
- "itertools",
+ "itertools 0.14.0",
  "libc",
  "libfuzzer-sys",
  "log",
@@ -4891,7 +5051,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2964d0cf57a3e7a06e8183d14a8b527195c706b7983549cd5462d5aa3747438f"
 dependencies = [
  "either",
- "itertools",
+ "itertools 0.14.0",
  "rayon",
 ]
 
@@ -6467,7 +6627,7 @@ dependencies = [
  "esaxx-rs",
  "fancy-regex 0.14.0",
  "getrandom 0.3.4",
- "itertools",
+ "itertools 0.14.0",
  "log",
  "macro_rules_attribute",
  "monostate",
@@ -6617,7 +6777,7 @@ dependencies = [
  "serde",
  "serde_spanned 0.6.9",
  "toml_datetime 0.6.11",
- "toml_edit",
+ "toml_edit 0.22.27",
 ]
 
 [[package]]
@@ -6664,6 +6824,18 @@ dependencies = [
  "serde_spanned 0.6.9",
  "toml_datetime 0.6.11",
  "toml_write",
+ "winnow",
+]
+
+[[package]]
+name = "toml_edit"
+version = "0.23.10+spec-1.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "84c8b9f757e028cee9fa244aea147aab2a9ec09d5325a9b01e0a49730c2b5269"
+dependencies = [
+ "indexmap 2.13.0",
+ "toml_datetime 0.7.5+spec-1.1.0",
+ "toml_parser",
  "winnow",
 ]
 

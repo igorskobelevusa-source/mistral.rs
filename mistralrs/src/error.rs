@@ -50,6 +50,10 @@ pub enum Error {
         /// Description of the response type that was expected.
         expected: &'static str,
     },
+
+    /// The requested API surface is not yet supported by the active backend.
+    #[error("unsupported operation: {0}")]
+    Unsupported(String),
 }
 
 /// Convenience type alias for `std::result::Result<T, Error>`.

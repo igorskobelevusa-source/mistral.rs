@@ -8,7 +8,10 @@ use std::{path::PathBuf, sync::Arc};
 use tokio::sync::mpsc::{channel, Receiver};
 
 use crate::error::Error as SdkError;
-use crate::{EmbeddingRequest, EmbeddingRequestBuilder, RequestLike, TextMessages};
+use crate::{
+    BackendFeatures, BatchDecodeOutput, DecodeSession, DecodeSessionConfig, DecodeStepOutput,
+    EmbeddingRequest, EmbeddingRequestBuilder, PrefillOutput, RequestLike, TextMessages,
+};
 
 // Re-export for convenience
 pub use mistralrs_core::{AddModelConfig, ModelStatus, Pipeline, SchedulerConfig};
@@ -98,6 +101,112 @@ impl Model {
     /// Prefer using a builder (e.g., [`ModelBuilder`](crate::ModelBuilder)) instead.
     pub fn new(runner: Arc<MistralRs>) -> Self {
         Self { runner }
+    }
+
+    // ========================================================================
+    // Experimental Stateful Decode Methods
+    // ========================================================================
+
+    /// Report whether the active backend exposes low-level stateful decode APIs.
+    ///
+    /// This is intended for higher-level runtimes that want to own token-level
+    /// scheduling externally while still using `mistral.rs` as the execution engine.
+    pub fn backend_features(&self) -> BackendFeatures {
+        self.backend_features_with_model(None)
+    }
+
+    /// Report whether a specific model exposes low-level stateful decode APIs.
+    /// If `model_id` is `None`, the default model is used.
+    pub fn backend_features_with_model(&self, model_id: Option<&str>) -> BackendFeatures {
+        self.runner.backend_features(model_id).unwrap_or_default()
+    }
+
+    /// Create a new opaque decode session.
+    ///
+    /// The initial SDK surface is intentionally conservative: until the engine
+    /// exposes stateful stepping internally, this returns
+    /// [`SdkError::Unsupported`].
+    pub async fn new_decode_session(&self) -> crate::error::Result<DecodeSession> {
+        self.new_decode_session_with_model(DecodeSessionConfig::default(), None)
+            .await
+    }
+
+    /// Create a new opaque decode session for a specific model.
+    /// If `model_id` is `None`, the default model is used.
+    pub async fn new_decode_session_with_model(
+        &self,
+        config: DecodeSessionConfig,
+        model_id: Option<&str>,
+    ) -> crate::error::Result<DecodeSession> {
+        self.runner
+            .new_decode_session(model_id, config)
+            .map_err(SdkError::from)
+    }
+
+    /// Run prompt prefill against an existing decode session.
+    pub async fn prefill(
+        &self,
+        session: &mut DecodeSession,
+        input_ids: &[u32],
+    ) -> crate::error::Result<PrefillOutput> {
+        self.prefill_with_model(session, input_ids, None).await
+    }
+
+    /// Run prompt prefill against an existing decode session for a specific model.
+    /// If `model_id` is `None`, the default model is used.
+    pub async fn prefill_with_model(
+        &self,
+        session: &mut DecodeSession,
+        input_ids: &[u32],
+        model_id: Option<&str>,
+    ) -> crate::error::Result<PrefillOutput> {
+        self.runner
+            .prefill(model_id, session, input_ids)
+            .map_err(SdkError::from)
+    }
+
+    /// Advance one externally managed sequence by a single token.
+    pub async fn decode_step(
+        &self,
+        session: &mut DecodeSession,
+        token_id: u32,
+    ) -> crate::error::Result<DecodeStepOutput> {
+        self.decode_step_with_model(session, token_id, None).await
+    }
+
+    /// Advance one externally managed sequence by a single token for a specific model.
+    /// If `model_id` is `None`, the default model is used.
+    pub async fn decode_step_with_model(
+        &self,
+        session: &mut DecodeSession,
+        token_id: u32,
+        model_id: Option<&str>,
+    ) -> crate::error::Result<DecodeStepOutput> {
+        self.runner
+            .decode_step(model_id, session, token_id)
+            .map_err(SdkError::from)
+    }
+
+    /// Advance multiple externally managed sessions in a single backend batch.
+    pub async fn decode_batch(
+        &self,
+        sessions: &mut [&mut DecodeSession],
+        token_ids: &[u32],
+    ) -> crate::error::Result<BatchDecodeOutput> {
+        self.decode_batch_with_model(sessions, token_ids, None).await
+    }
+
+    /// Advance multiple externally managed sessions in a single backend batch for a
+    /// specific model. If `model_id` is `None`, the default model is used.
+    pub async fn decode_batch_with_model(
+        &self,
+        sessions: &mut [&mut DecodeSession],
+        token_ids: &[u32],
+        model_id: Option<&str>,
+    ) -> crate::error::Result<BatchDecodeOutput> {
+        self.runner
+            .decode_batch(model_id, sessions, token_ids)
+            .map_err(SdkError::from)
     }
 
     // ========================================================================

@@ -264,6 +264,12 @@ pub use candle_nn::loss::cross_entropy as cross_entropy_loss;
 /// use cases like custom pipelines, device mapping, or direct engine access.
 pub mod core;
 
+// ========== Stateful Decode ==========
+pub use mistralrs_core::{
+    BackendFeatures, BatchDecodeOutput, DecodeSession, DecodeSessionConfig, DecodeStepOutput,
+    PrefillOutput, StatefulModel,
+};
+
 // ========== Response Types ==========
 pub use mistralrs_core::{
     ChatCompletionChunkResponse, ChatCompletionResponse, Choice, ChunkChoice, CompletionResponse,

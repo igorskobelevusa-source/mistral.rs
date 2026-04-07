@@ -3,8 +3,10 @@ use mistralrs_core::*;
 use mistralrs_core::{SearchCallback, Tool, ToolCallback};
 use std::collections::HashMap;
 
-use crate::model_builder_trait::{build_gguf_pipeline, build_model_from_pipeline};
-use crate::Model;
+use crate::model_builder_trait::{
+    build_gguf_pipeline, build_model_from_pipeline, build_stateful_model_from_pipeline,
+};
+use crate::{Model, StatefulModel};
 use std::sync::Arc;
 
 #[derive(Clone)]
@@ -230,5 +232,11 @@ impl GgufModelBuilder {
     pub async fn build(self) -> anyhow::Result<Model> {
         let (pipeline, scheduler_config, add_model_config) = build_gguf_pipeline(self).await?;
         Ok(build_model_from_pipeline(pipeline, scheduler_config, add_model_config).await)
+    }
+
+    /// Load the GGUF model for future external-scheduler execution.
+    pub async fn build_stateful(self) -> anyhow::Result<StatefulModel> {
+        let (pipeline, scheduler_config, add_model_config) = build_gguf_pipeline(self).await?;
+        Ok(build_stateful_model_from_pipeline(pipeline, scheduler_config, add_model_config).await)
     }
 }

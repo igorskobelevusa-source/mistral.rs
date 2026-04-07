@@ -74,6 +74,7 @@ mod sampler;
 mod scheduler;
 mod sequence;
 mod speech_models;
+mod stateful_decode;
 pub mod think_tags;
 mod toml_selector;
 mod tools;
@@ -133,6 +134,10 @@ pub use scheduler::{DefaultSchedulerMethod, SchedulerConfig};
 pub use search::{SearchCallback, SearchFunctionParameters, SearchResult};
 use serde::Serialize;
 pub use speech_models::{utils as speech_utils, SpeechGenerationConfig, SpeechLoaderType};
+pub use stateful_decode::{
+    BackendFeatures, BatchDecodeOutput, DecodeSession, DecodeSessionConfig, DecodeStepOutput,
+    PrefillOutput, StatefulModel,
+};
 use tokio::runtime::Runtime;
 use toml_selector::{TomlLoaderArgs, TomlSelector};
 pub use tools::{ToolCallResponse, ToolCallType, ToolCallbacks, ToolChoice};
@@ -359,6 +364,8 @@ pub enum MistralRsError {
     ModelAlreadyLoaded(String),
     /// Model is already unloaded
     ModelAlreadyUnloaded(String),
+    /// The requested API surface is not yet supported by the active backend.
+    Unsupported(String),
 }
 
 impl std::fmt::Display for MistralRsError {
@@ -1424,6 +1431,61 @@ impl MistralRs {
         } else {
             Err(format!("Model {resolved_model_id} not found"))
         }
+    }
+
+    /// Report whether a model exposes low-level stateful decode APIs.
+    pub fn backend_features(
+        &self,
+        _model_id: Option<&str>,
+    ) -> Result<BackendFeatures, MistralRsError> {
+        Ok(BackendFeatures::default())
+    }
+
+    /// Create a new opaque decode session for a model.
+    pub fn new_decode_session(
+        &self,
+        _model_id: Option<&str>,
+        _config: DecodeSessionConfig,
+    ) -> Result<DecodeSession, MistralRsError> {
+        Err(MistralRsError::Unsupported(
+            "stateful decode is not exposed by this backend yet".into(),
+        ))
+    }
+
+    /// Run prompt prefill against an existing decode session.
+    pub fn prefill(
+        &self,
+        _model_id: Option<&str>,
+        _session: &mut DecodeSession,
+        _input_ids: &[u32],
+    ) -> Result<PrefillOutput, MistralRsError> {
+        Err(MistralRsError::Unsupported(
+            "stateful decode is not exposed by this backend yet".into(),
+        ))
+    }
+
+    /// Advance one externally managed sequence by a single token.
+    pub fn decode_step(
+        &self,
+        _model_id: Option<&str>,
+        _session: &mut DecodeSession,
+        _token_id: u32,
+    ) -> Result<DecodeStepOutput, MistralRsError> {
+        Err(MistralRsError::Unsupported(
+            "stateful decode is not exposed by this backend yet".into(),
+        ))
+    }
+
+    /// Advance multiple externally managed sessions in a single backend batch.
+    pub fn decode_batch(
+        &self,
+        _model_id: Option<&str>,
+        _sessions: &mut [&mut DecodeSession],
+        _token_ids: &[u32],
+    ) -> Result<BatchDecodeOutput, MistralRsError> {
+        Err(MistralRsError::Unsupported(
+            "external batched decode is not exposed by this backend yet".into(),
+        ))
     }
 
     /// Unload a model from memory while preserving its configuration for later reload.

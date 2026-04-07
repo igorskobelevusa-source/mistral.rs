@@ -8,7 +8,7 @@ use mistralrs_core::{
 use std::{collections::HashMap, path::PathBuf, sync::Arc};
 use tokio::sync::Mutex;
 
-use crate::Model;
+use crate::{Model, StatefulModel};
 
 /// Enum representing all possible model builders that can be used with [`MultiModelBuilder`].
 pub enum AnyModelBuilder {
@@ -490,6 +490,42 @@ pub async fn build_model_from_pipeline(
         .with_prefix_cache_n(add_model_config.engine_config.prefix_cache_n);
 
     Model::new(runner_builder.build().await)
+}
+
+/// Create a StatefulModel from pipeline components.
+///
+/// This preserves direct access to the loaded pipeline for a future external
+/// scheduler instead of immediately wrapping it in the engine-thread runtime.
+pub async fn build_stateful_model_from_pipeline(
+    pipeline: Arc<Mutex<dyn mistralrs_core::Pipeline>>,
+    scheduler_config: SchedulerConfig,
+    add_model_config: AddModelConfig,
+) -> StatefulModel {
+    let pipeline_guard = pipeline.lock().await;
+    let metadata = pipeline_guard.get_metadata();
+    let category = pipeline_guard.category();
+    let max_seq_len = match &category {
+        mistralrs_core::ModelCategory::Diffusion | mistralrs_core::ModelCategory::Speech => None,
+        _ => Some(metadata.max_seq_len),
+    };
+    let config = mistralrs_core::MistralRsConfig {
+        kind: metadata.kind.clone(),
+        device: pipeline_guard.device(),
+        category,
+        modalities: metadata.modalities.clone(),
+        max_seq_len,
+    };
+    let model_id = pipeline_guard.name();
+    drop(pipeline_guard);
+
+    StatefulModel::new(
+        pipeline,
+        scheduler_config,
+        add_model_config.engine_config,
+        model_id,
+        config,
+    )
+    .await
 }
 
 /// Build a text model pipeline from a TextModelBuilder.
