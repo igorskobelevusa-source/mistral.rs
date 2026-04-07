@@ -245,7 +245,14 @@ impl StatefulModel {
         let eos_tokens = pipeline.get_metadata().eos_tok.clone();
         let is_xlora = pipeline.get_metadata().is_xlora;
         let block_size = pipeline.get_metadata().cache_config.clone().map(|c| c.block_size);
-        let preallocated_cache = build_preallocated_cache(&*pipeline, num_hidden_layers, 0)?;
+        let preallocated_tokens = config
+            .sampling_params
+            .max_len
+            .or(self.config.max_seq_len)
+            .unwrap_or(crate::kv_cache::NormalCache::CACHE_GROW_SIZE)
+            .max(crate::kv_cache::NormalCache::CACHE_GROW_SIZE);
+        let preallocated_cache =
+            build_preallocated_cache(&*pipeline, num_hidden_layers, preallocated_tokens)?;
         drop(pipeline);
 
         let (tx, rx) = tokio::sync::mpsc::channel::<Response>(1);
