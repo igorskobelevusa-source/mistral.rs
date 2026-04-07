@@ -9,10 +9,14 @@ use crate::{
     paged_attention::KVCacheManager, prefix_cacher::MatchingCache,
     prefix_cacher::PrefixCacheManagerV2, response::Response, sampler::Sampler,
     sequence::SeqStepType, sequence::Sequence, sequence::SequenceGroup,
-    sequence::SequenceRecognizer, EngineConfig, MistralRsError, MistralRsConfig, Pipeline,
-    SamplingParams, SchedulerConfig, StopTokens,
+    sequence::SequenceRecognizer, sequence::SequenceState, EngineConfig, MistralRsError,
+    MistralRsConfig, Pipeline, SamplingParams, SchedulerConfig, StopTokens,
+};
+use crate::pipeline::{
+    text_models_inputs_processor::PagedAttentionMeta, CacheBackendMetadata, CacheInstruction,
 };
 use candle_core::Tensor;
+use futures::Future;
 use rand::SeedableRng;
 use rand_isaac::Isaac64Rng;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -55,7 +59,14 @@ pub struct PrefillOutput {
 
 /// Result of advancing a single sequence by one decode step.
 #[derive(Debug, Clone, Default)]
-pub struct DecodeStepOutput;
+pub struct DecodeStepOutput {
+    /// Token produced by the backend during this step, if any.
+    pub token: Option<u32>,
+    /// Decoded text delta made visible by this step, if any.
+    pub text_delta: Option<String>,
+    /// Whether the sequence has reached a terminal state.
+    pub is_done: bool,
+}
 
 /// Result of advancing multiple externally managed sessions together.
 #[derive(Debug, Clone, Default)]
@@ -175,7 +186,7 @@ impl StatefulModel {
 
     pub fn backend_features(&self) -> BackendFeatures {
         BackendFeatures {
-            supports_stateful_decode: false,
+            supports_stateful_decode: true,
             supports_external_scheduler: false,
         }
     }
@@ -412,12 +423,169 @@ impl StatefulModel {
 
     pub fn decode_step(
         &self,
-        _session: &mut DecodeSession,
-        _token_id: u32,
+        session: &mut DecodeSession,
+        token_id: u32,
     ) -> Result<DecodeStepOutput, MistralRsError> {
-        Err(MistralRsError::Unsupported(
-            "stateful decode is not exposed by this backend yet".into(),
-        ))
+        let runtime = session.runtime.as_ref().ok_or_else(|| {
+            MistralRsError::Unsupported("decode session is missing runtime state".into())
+        })?;
+        let mut sequence = session.sequence.take().ok_or_else(|| {
+            MistralRsError::Unsupported("decode session is missing sequence state".into())
+        })?;
+
+        let is_prompt = sequence.is_prompt() || sequence.is_waiting();
+        if !is_prompt {
+            let expected = sequence.get_toks().last().copied().ok_or_else(|| {
+                MistralRsError::Unsupported(
+                    "decode session has no prior token to continue from".into(),
+                )
+            })?;
+            if token_id != expected {
+                session.sequence = Some(sequence);
+                return Err(MistralRsError::Unsupported(format!(
+                    "stateful decode_step currently uses backend-managed sampling; expected token {expected}, got {token_id}"
+                )));
+            }
+        }
+
+        if is_prompt {
+            sequence.set_state(SequenceState::RunningPrompt);
+            sequence.set_step_start_instant();
+        } else {
+            sequence.set_state(SequenceState::RunningCompletion);
+            if runtime.has_paged_attention {
+                let mut kv_mgr = runtime
+                    .paged_kv_cache_manager
+                    .as_ref()
+                    .ok_or_else(|| {
+                        MistralRsError::Unsupported(
+                            "paged attention is enabled but no KV cache manager is present".into(),
+                        )
+                    })?
+                    .try_lock()
+                    .map_err(|_| {
+                        MistralRsError::Unsupported(
+                            "stateful paged KV manager is currently busy; try again".into(),
+                        )
+                    })?;
+                kv_mgr
+                    .allocate_slots(*sequence.id(), sequence.len() + 1, &[])
+                    .ok_or_else(|| {
+                        MistralRsError::Unsupported(
+                            "failed to allocate paged KV slots for stateful decode".into(),
+                        )
+                    })?;
+            }
+        }
+
+        let step_duration = match run_stateful_future(async {
+            let mut pipeline = runtime.pipeline.lock().await;
+            let mut prefix_cacher = runtime.prefix_cacher.lock().await;
+            let return_raw_logits = sequence.return_raw_logits;
+
+            if runtime.has_paged_attention {
+                let block_size = {
+                    let kv_mgr = runtime
+                        .paged_kv_cache_manager
+                        .as_ref()
+                        .expect("paged KV manager exists when paged attention is enabled")
+                        .lock()
+                        .await;
+                    kv_mgr.block_size()
+                };
+                let metadata = PagedAttentionMeta {
+                    block_size,
+                    sliding_window: pipeline.get_metadata().sliding_window,
+                    kv_cache_manager: runtime
+                        .paged_kv_cache_manager
+                        .as_ref()
+                        .expect("paged KV manager exists when paged attention is enabled")
+                        .clone(),
+                };
+                let mut seqs = vec![&mut sequence];
+                pipeline
+                    .step(
+                        &mut seqs,
+                        is_prompt,
+                        return_raw_logits,
+                        &mut prefix_cacher,
+                        self.engine_config.disable_eos_stop,
+                        runtime.rng.clone(),
+                        CacheBackendMetadata::PagedAttention { metadata },
+                    )
+                    .await
+            } else {
+                let pre_op = if is_prompt {
+                    if sequence.token_offset() != 0 {
+                        CacheInstruction::In
+                    } else {
+                        CacheInstruction::Reset {
+                            load_preallocated_cache: true,
+                            reset_non_granular: false,
+                        }
+                    }
+                } else if !self.engine_config.no_kv_cache {
+                    CacheInstruction::In
+                } else {
+                    CacheInstruction::Nothing
+                };
+                let post_op = if !self.engine_config.no_kv_cache {
+                    CacheInstruction::Out
+                } else {
+                    CacheInstruction::Reset {
+                        load_preallocated_cache: false,
+                        reset_non_granular: false,
+                    }
+                };
+                let mut seqs = vec![&mut sequence];
+                pipeline
+                    .step(
+                        &mut seqs,
+                        is_prompt,
+                        return_raw_logits,
+                        &mut prefix_cacher,
+                        self.engine_config.disable_eos_stop,
+                        runtime.rng.clone(),
+                        CacheBackendMetadata::DefaultInstructions { pre_op, post_op },
+                    )
+                    .await
+            }
+        }) {
+            Ok(duration) => duration,
+            Err(e) => {
+                session.sequence = Some(sequence);
+                return Err(MistralRsError::Unsupported(format!(
+                    "stateful decode step failed: {e}"
+                )));
+            }
+        };
+
+        let output = DecodeStepOutput {
+            token: sequence.logprobs().last().map(|logprob| logprob.token),
+            text_delta: sequence.peek_delta().ok().flatten(),
+            is_done: matches!(sequence.getstate(), SequenceState::Done(_)),
+        };
+
+        if is_prompt && !output.is_done {
+            match sequence.sequence_stepping_type() {
+                SeqStepType::OneShot => (),
+                SeqStepType::PromptAndDecode => sequence.set_state(SequenceState::RunningCompletion),
+            }
+            #[allow(clippy::cast_precision_loss)]
+            let prompt_tok_per_sec = sequence.len() as f32 / step_duration.as_secs_f32();
+            sequence.prompt_tok_per_sec = prompt_tok_per_sec;
+            sequence.prompt_timestamp = Some(
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .expect("Time travel has occurred!")
+                    .as_millis(),
+            );
+            sequence.total_prompt_time = Some(step_duration.as_millis());
+            sequence.step_start_instant = None;
+        }
+
+        session.sequence = Some(sequence);
+        Ok(output)
     }
 
     pub fn decode_batch(
@@ -428,6 +596,37 @@ impl StatefulModel {
         Err(MistralRsError::Unsupported(
             "external batched decode is not exposed by this backend yet".into(),
         ))
+    }
+}
+
+fn run_stateful_future<F, T>(future: F) -> Result<T, MistralRsError>
+where
+    F: Future<Output = Result<T, candle_core::Error>>,
+{
+    match tokio::runtime::Handle::try_current() {
+        Ok(handle) => {
+            if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::CurrentThread {
+                Err(MistralRsError::Unsupported(
+                    "stateful blocking step cannot run inside a single-threaded Tokio runtime"
+                        .into(),
+                ))
+            } else {
+                tokio::task::block_in_place(|| {
+                    handle
+                        .block_on(future)
+                        .map_err(|e| MistralRsError::Unsupported(e.to_string()))
+                })
+            }
+        }
+        Err(_) => {
+            let rt = tokio::runtime::Runtime::new().map_err(|e| {
+                MistralRsError::Unsupported(format!(
+                    "failed to create runtime for stateful decode: {e}"
+                ))
+            })?;
+            rt.block_on(future)
+                .map_err(|e| MistralRsError::Unsupported(e.to_string()))
+        }
     }
 }
 
