@@ -1021,21 +1021,61 @@ impl<T: CacheManagerMixin + MetadataMixin + ?Sized> CacheManager<T> for HybridCa
                     if let Some(ref template) = template_cache {
                         match (template, kv_cache) {
                             (KvCache::Normal { k: tk, .. }, KvCache::Normal { k, v }) => {
-                                k.all_data = Some(batched_k);
+                                // Pre-allocate full max_seq_len buffer so that subsequent
+                                // decode steps via SingleCache::append can fit (N+1) tokens.
+                                // Mirrors SingleCache::append's first-use path.
+                                let mut k_shape = batched_k.dims().to_vec();
+                                let mut v_shape = batched_v.dims().to_vec();
+                                k_shape[k.dim] = tk.max_seq_len;
+                                v_shape[v.dim] = tk.max_seq_len;
+                                let k_buf = Tensor::zeros(
+                                    k_shape,
+                                    batched_k.dtype(),
+                                    batched_k.device(),
+                                )
+                                .unwrap();
+                                k_buf.slice_set(&batched_k, k.dim, 0).unwrap();
+                                let v_buf = Tensor::zeros(
+                                    v_shape,
+                                    batched_v.dtype(),
+                                    batched_v.device(),
+                                )
+                                .unwrap();
+                                v_buf.slice_set(&batched_v, v.dim, 0).unwrap();
+                                k.all_data = Some(k_buf);
                                 k.current_seq_len = tk.current_seq_len;
-                                k.capacity_seq_len = tk.current_seq_len;
-                                v.all_data = Some(batched_v);
+                                k.capacity_seq_len = tk.max_seq_len;
+                                v.all_data = Some(v_buf);
                                 v.current_seq_len = tk.current_seq_len;
-                                v.capacity_seq_len = tk.current_seq_len;
+                                v.capacity_seq_len = tk.max_seq_len;
                             }
                             (KvCache::Rotating { k: tk, .. }, KvCache::Rotating { k, v }) => {
-                                k.all_data = Some(batched_k);
+                                // Pre-allocate full max_seq_len buffer (same rationale).
+                                let mut k_shape = batched_k.dims().to_vec();
+                                let mut v_shape = batched_v.dims().to_vec();
+                                k_shape[k.dim] = tk.max_seq_len;
+                                v_shape[v.dim] = tk.max_seq_len;
+                                let k_buf = Tensor::zeros(
+                                    k_shape,
+                                    batched_k.dtype(),
+                                    batched_k.device(),
+                                )
+                                .unwrap();
+                                k_buf.slice_set(&batched_k, k.dim, 0).unwrap();
+                                let v_buf = Tensor::zeros(
+                                    v_shape,
+                                    batched_v.dtype(),
+                                    batched_v.device(),
+                                )
+                                .unwrap();
+                                v_buf.slice_set(&batched_v, v.dim, 0).unwrap();
+                                k.all_data = Some(k_buf);
                                 k.current_seq_len = tk.current_seq_len;
-                                k.capacity_seq_len = tk.current_seq_len;
+                                k.capacity_seq_len = tk.max_seq_len;
                                 k.offset = tk.offset;
-                                v.all_data = Some(batched_v);
+                                v.all_data = Some(v_buf);
                                 v.current_seq_len = tk.current_seq_len;
-                                v.capacity_seq_len = tk.current_seq_len;
+                                v.capacity_seq_len = tk.max_seq_len;
                                 v.offset = tk.offset;
                             }
                             _ => {}
